@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Buy-Mug Scout
 // @namespace    torn-buymugger-scout
-// @version      1.0.0
+// @version      1.0.3
 // @description  Flags buy-muggable bazaar sellers using FFScouter battle-stat estimates, with toggleable filters, a watchlist for players who are nearly back, and an in-page UI. If you enjoy it, send a Xanax to Egco [2598210].
 // @author       Egco [2598210]
 // @license      AGPL-3.0-or-later
