@@ -164,7 +164,7 @@
         on: true,
         value: 5
       },
-      maxLastAction: {
+      notActiveWithin: {
         on: false,
         value: 30
       },
@@ -1205,12 +1205,12 @@
         fail.push(status.isHospital ? "hospitalised" : status.isJail ? "jailed" : status.isFederal ? "federal" : "fallen");
       }
     }
-    if (f.maxLastAction.on) {
+    if (f.notActiveWithin.on) {
       const mins = subject.lastActionAgo !== null ? subject.lastActionAgo / 60 : null;
-      if (mins !== null && mins > f.maxLastAction.value) {
-        fail.push("idle " + formatAgo(subject.lastActionAgo));
+      if (mins !== null && mins < f.notActiveWithin.value) {
+        fail.push("active " + formatAgo(subject.lastActionAgo) + " ago");
       } else if (mins !== null) {
-        pass.push("active " + formatAgo(subject.lastActionAgo) + " ago");
+        pass.push("idle " + formatAgo(subject.lastActionAgo));
       }
     }
     const onSale = subject.listingSummary || subject.itemSummary || bazar;
@@ -2390,10 +2390,10 @@
       hint: "You cannot mug someone who is already locked up."
     }, {
       type: "toggleNumber",
-      path: "filters.maxLastAction",
-      label: "Active within",
+      path: "filters.notActiveWithin",
+      label: "Not active within",
       suffix: "min",
-      hint: "Long-idle players rarely keep mug-worthy cash on hand."
+      hint: "Keeps players who have not acted inside this window. A seller who just moved is likely watching their own bazaar."
     }, {
       type: "toggleNumber",
       path: "filters.soonInTorn",

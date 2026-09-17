@@ -836,6 +836,32 @@ function inMinutes(mins, state, description) {
   return s.readStatus({ status: { state, description, until } });
 }
 
+test('the inactivity filter keeps idlers and drops the recently active', () => {
+  const cfg = settingsWith((c) => {
+    c.filters.notActiveWithin.on = true;
+    c.filters.notActiveWithin.value = 30;
+  });
+
+  const idle = s.evaluateTarget(makeSubject({ lastActionAgo: 45 * 60 }), { settings: cfg });
+  assert.equal(idle.verdict, 'match', JSON.stringify(idle.reasons));
+  assert.ok(idle.positives.includes('idle 45m'), JSON.stringify(idle.positives));
+
+  const busy = s.evaluateTarget(makeSubject({ lastActionAgo: 2 * 60 }), { settings: cfg });
+  assert.equal(busy.verdict, 'reject');
+  assert.ok(busy.reasons.includes('active 2m ago'), JSON.stringify(busy.reasons));
+});
+
+test('the inactivity filter is off by default and switchable', () => {
+  assert.equal(s.DEFAULT_SETTINGS.filters.notActiveWithin.on, false);
+
+  const subject = makeSubject({ lastActionAgo: 5 });
+  assert.equal(
+    s.evaluateTarget(subject, { settings: settingsWith() }).verdict,
+    'match',
+    'an active seller passes while the filter is off'
+  );
+});
+
 test('someone landing shortly is allowed through the abroad rule', () => {
   const subject = makeSubject({ status: inMinutes(4, 'Abroad', 'Travelling to China') });
 
