@@ -2,6 +2,9 @@
 
 Made by **Egco [2598210]**. If you enjoy it, send a Xanax.
 
+**Licence: AGPL-3.0-or-later** - free software, no charge, no warranty. See
+[LICENSE](LICENSE) for the full text.
+
 A Tampermonkey userscript that reads the bazaar and item-market pages you
 are already looking at, works out which sellers are worth buy-mugging, and
 shows you a shortlist. Everything it checks is a toggle you can turn off or
@@ -542,3 +545,20 @@ depends on are:
 curl "https://ffscouter.com/api/v1/get-stats?key=KEY&targets=1,2,3"
 curl "https://api.torn.com/user/1?selections=profile,basic&key=KEY"
 ```
+
+## Licence
+
+**GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later).**
+
+This is free software: you may use, study, share and modify it, with no
+charge. It comes with **no warranty**. The full text is in
+[LICENSE](LICENSE).
+
+The AGPL is the strongest copyleft licence in common use. It is GPL-3.0
+plus a clause that closes the network loophole: anyone who redistributes
+this script, **or runs a modified version of it as a network service**,
+must release their source under the same terms. In short - take it, change
+it, share it, but what you build on it stays free for everyone else too.
+
+If you use this in your own project, keep the copyright notice and the
+licence with it.
