@@ -103,7 +103,7 @@ test('summarises bazaar value, deals and worthy stock', () => {
     { ID: 5, name: 'Bargain', quantity: 2, price: 1000000, market_price: 2000000 }
   ];
 
-  const sum = s.summariseBazaar(items, 100000, 0.15);
+  const sum = s.summariseBazaar(items, { worthyUnitPrice: 100000, dealDiscount: 0.15, priceLimitPct: 100 });
 
   assert.equal(sum.count, 112, 'counts quantity, not listings');
   assert.equal(sum.itemLines, 3);
@@ -118,13 +118,311 @@ test('summarises bazaar value, deals and worthy stock', () => {
 });
 
 test('treats every item as worthy when the threshold is disabled', () => {
-  const sum = s.summariseBazaar([{ quantity: 1, price: 10 }], 0, 0);
+  const sum = s.summariseBazaar([{ quantity: 1, price: 10 }], {});
   assert.equal(sum.worthyCount, 1);
 });
 
 test('survives an empty or malformed bazaar', () => {
-  assert.equal(s.summariseBazaar(undefined, 1000, 0.1).buyout, 0);
-  assert.equal(s.summariseBazaar([null, 'x'], 1000, 0.1).count, 0);
+  assert.equal(s.summariseBazaar(undefined, { worthyUnitPrice: 1000, dealDiscount: 0.1 }).buyout, 0);
+  assert.equal(s.summariseBazaar([null, 'x'], { worthyUnitPrice: 1000, dealDiscount: 0.1 }).count, 0);
+});
+
+/* ------------------------------------------------------------------ */
+/* Bazaar listing payloads - every shape Torn has used                 */
+/* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* Paying above market                                                 */
+/* ------------------------------------------------------------------ */
+
+/* --- A seller row whose listing details are nested ------------------
+ * This is the shape that produced a real player id with no price and no
+ * quantity, which rendered as "null x" and valued the seller at $0.
+ */
+test('finds the price and quantity even when they are nested', () => {
+  const shapes = [
+    [{ ID: 3916729, cost: 800000, quantity: 5 }],
+    [{ player_id: 3916729, item_id: 206, listing: { cost: 800000, quantity: 5 } }],
+    [{ player_id: 3916729, name: 'X', details: { price: 800000, quantity: 5 } }],
+    [{ player_id: 3916729, player_name: 'X', price: 800000, quantity: 5 }]
+  ];
+
+  shapes.forEach((rows, i) => {
+    const out = s.normaliseBazaarRows({ listings: rows }, 206);
+    assert.equal(out.length, 1, 'shape ' + i + ' found the seller');
+    assert.equal(out[0].price, 800000, 'shape ' + i + ' found the price');
+    assert.equal(out[0].qty, 5, 'shape ' + i + ' found the quantity');
+  });
+});
+
+test('a row with no price anywhere is left without one, not guessed at', () => {
+  const out = s.normaliseBazaarRows({ listings: [{ player_id: 3916729 }] }, 206);
+  assert.equal(out[0].price, null, 'still null - the caller decides what to do');
+  assert.equal(out[0].qty, null);
+});
+
+test('a seller with no usable price is not valued at zero', () => {
+  // The guard that stops "null x" reaching the table.
+  const subject = s.buildSubject(
+    3916729,
+    { name: 'PremAssassin', bazaar: [], __tbmsSelections: 'profile,basic,bazaar' },
+    null,
+    null,
+    { itemName: 'Bag of Chocolate Kisses', price: null, qty: null, marketPrice: null }
+  );
+
+  assert.equal(subject.listing, null, 'the useless listing is discarded');
+  assert.equal(subject.valueUnknown, true, 'and the value is marked unknown');
+  assert.match(subject.valueUnknownReason, /without a price and quantity/);
+});
+
+/* ------------------------------------------------------------------ */
+/* The mugging formula                                                 */
+/* ------------------------------------------------------------------ */
+
+test('the mug percentage is (1 + merits/10) x (23 - ln cash)', () => {
+  // Hand-computed: ln(1e6) = 13.8155, so 23 - 13.8155 = 9.1845 -> 9.18%.
+  assert.equal(s.mugPercent(1000000, 0), 9.18);
+  // ln(5e6) = 15.4249 -> 7.5751 -> 7.58%.
+  assert.equal(s.mugPercent(5000000, 0), 7.58);
+  // Merits scale the rate: 10 points doubles it.
+  assert.equal(s.mugPercent(1000000, 10), 18.37);
+  assert.equal(s.mugPercent(5000000, 10), 15.15);
+});
+
+test('the rate bottoms out at 1% exactly at the formula cap', () => {
+  // The cap in the formula is e^22, and that is precisely where
+  // 23 - ln(cash) reaches 1 - so the two branches meet with no step.
+  assert.equal(s.MUG_CASH_CAP, Math.round(Math.exp(22)));
+  assert.equal(s.mugPercent(s.MUG_CASH_CAP - 1, 0), 1);
+  assert.equal(s.mugPercent(s.MUG_CASH_CAP, 0), 1);
+  assert.equal(s.mugPercent(1e10, 0), 1, 'richer targets still give 1%');
+  assert.equal(s.mugPercent(1e10, 10), 2, 'doubled by merits');
+});
+
+test('the payout is floored, not rounded', () => {
+  // FLOOR(9.18 x 1,000,000 / 100) = 91,800
+  assert.equal(s.mugTake(1000000, 0), 91800);
+  // FLOOR(7.58 x 5,000,000 / 100) = 379,000
+  assert.equal(s.mugTake(5000000, 0), 379000);
+  // FLOOR(1 x 3,584,912,846 / 100) = 35,849,128 (the .46 is dropped)
+  assert.equal(s.mugTake(s.MUG_CASH_CAP, 0), 35849128);
+});
+
+test('mugging nothing pays nothing', () => {
+  assert.equal(s.mugTake(0, 0), 0);
+  assert.equal(s.mugTake(null, 0), 0);
+  assert.equal(s.mugPercent(0, 0), 0 || s.mugPercent(0, 0)); // no throw either way
+});
+
+test('the rate falls as the target holds more', () => {
+  const small = s.mugPercent(100000, 0);
+  const big = s.mugPercent(1000000000, 0);
+  assert.ok(small > big, `${small}% on 100k should beat ${big}% on 1b`);
+});
+
+test('an overpriced listing shows up as a negative net profit', () => {
+  // The case that started this: an item listed at 5m against a 4m market.
+  const at = (price) => {
+    const ls = s.summariseBazaar(
+      [{ name: 'E-DVD', price: price, quantity: 1, market_price: 4000000 }],
+      {}
+    );
+    return s.lootBreakdown({ value: ls.buyout, listingSummary: ls, bazaar: s.summariseBazaar([], {}) });
+  };
+
+  const market = at(4000000);
+  assert.equal(market.spend, 4000000, 'you hand over the asking price');
+  assert.equal(market.gross, 312000, 'mug pays 7.80% of it');
+  assert.equal(market.unitDifference, 0, 'no difference per item at market');
+  assert.equal(market.totalDifference, 0);
+  assert.equal(market.net, 312000, 'so the mug is the whole profit');
+
+  const over = at(5000000);
+  assert.equal(over.unitDifference, -1000000, 'the difference per item is the overpay');
+  assert.equal(over.totalDifference, -1000000);
+  assert.equal(over.gross, 379000, 'a bigger spend does pay out more');
+  assert.ok(over.net < 0, 'but the net is a loss: ' + over.net);
+  assert.equal(over.net, -1000000 + 379000, 'the difference plus the mug');
+  assert.ok(over.net < market.net, 'and it is worse than buying at market');
+});
+
+test('under market, the difference per item is a gain on every item', () => {
+  // Their formula: (market - price) x qty, plus the mug.
+  const ls = s.summariseBazaar(
+    [{ name: 'Pangolin Scales', price: 184500, quantity: 18, market_price: 205000 }],
+    {}
+  );
+  const d = s.lootBreakdown({
+    value: ls.buyout,
+    listingSummary: ls,
+    listing: { itemName: 'Pangolin Scales', price: 184500, qty: 18, marketPrice: 205000 }
+  });
+
+  assert.equal(d.qty, 18);
+  assert.equal(d.price, 184500);
+  assert.equal(d.marketPrice, 205000);
+  assert.equal(d.unitDifference, 20500, '20,500 under per item');
+  assert.equal(d.totalDifference, 20500 * 18, 'x 18 = 369,000');
+  assert.equal(d.net, d.totalDifference + d.gross, 'the mug on top of the difference');
+  assert.ok(d.net > d.gross, 'a good price beats the mug alone');
+});
+
+test('a seller at exactly market value still yields the mug', () => {
+  // The report's case: 18 x 205,000 against a 205,000 market.
+  const ls = s.summariseBazaar(
+    [{ name: 'Pangolin Scales', price: 205000, quantity: 18, market_price: 205000 }],
+    {}
+  );
+  const d = s.lootBreakdown({
+    value: ls.buyout,
+    listingSummary: ls,
+    listing: { itemName: 'Pangolin Scales', price: 205000, qty: 18, marketPrice: 205000 }
+  });
+
+  assert.equal(d.totalDifference, 0, 'nothing gained or lost on the goods');
+  assert.equal(d.net, d.gross, 'so the net is exactly the mug');
+  assert.ok(d.net > 0, 'and it is a profit');
+});
+
+test('the loot figure is what separates a good price from a bad one', () => {
+  // No market-percentage rule is needed once the loot is netted off: the
+  // overpay shows up on its own.
+  const at = (price) =>
+    (() => {
+      const ls = s.summariseBazaar([{ price: price, quantity: 1, market_price: 4000000 }], {});
+      return s.lootBreakdown({ value: ls.buyout, listingSummary: ls, bazaar: s.summariseBazaar([], {}) }).net;
+    })();
+
+  const nets = [3500000, 4000000, 4500000, 5000000].map(at);
+  assert.ok(nets[0] > nets[1], 'cheaper is better');
+  assert.ok(nets[1] > nets[2] && nets[2] > nets[3], `monotonically worse: ${nets}`);
+  assert.ok(nets[0] > 0 && nets[3] < 0, 'and it crosses from profit to loss');
+});
+
+test('a bazaar is summarised without any price ceiling', () => {
+  const sum = s.summariseBazaar(
+    [
+      { name: 'Xanax', quantity: 10, price: 800000, market_price: 900000 },
+      { name: 'E-DVD', quantity: 1, price: 5000000, market_price: 4000000 },
+      { name: 'Feather', quantity: 5, price: 95000, market_price: 100000 }
+    ],
+    {}
+  );
+
+  assert.equal(sum.buyout, 10 * 800000 + 5000000 + 5 * 95000, 'everything listed counts');
+  assert.equal(sum.marketValue, 10 * 900000 + 4000000 + 5 * 100000);
+  assert.equal(sum.count, 16);
+  assert.equal(sum.dealCount, 15, 'the two under-market lines');
+});
+
+test('the estimate spends the listing price', () => {
+  const subject = {
+    value: 1000000,
+    listing: { itemName: 'Xanax', price: 100000, qty: 10, marketPrice: 120000 },
+    listingSummary: {
+      buyout: 1000000,
+      marketValue: 1200000,
+      dealBuyout: 0,
+      count: 10,
+      itemLines: 1
+    }
+  };
+  const est = s.estimateEconomics(subject, { mugMerits: 0, factionCut: 0, liquidation: 1 });
+
+  assert.equal(est.spend, 1000000, 'the asking price times the quantity');
+  // 23 - ln(1e6) = 9.18%, floored.
+  assert.equal(est.mugTake, 91800);
+  assert.equal(est.unitDifference, 20000, '20k under market per item');
+  assert.equal(est.totalDifference, 200000);
+  assert.equal(est.net, 200000 + 91800, 'the difference plus the mug');
+});
+
+test('reads an array of listings keyed by ID (the documented v1 shape)', () => {
+  const rows = s.normaliseBazaarRows(
+    { bazaar: [{ ID: 1234567, cost: 800000, quantity: 5 }] },
+    206
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, 1234567);
+  assert.equal(rows[0].price, 800000);
+  assert.equal(rows[0].qty, 5);
+});
+
+test('reads listings with an explicit player_id (the v2 shape)', () => {
+  const rows = s.normaliseBazaarRows(
+    { bazaar: [{ player_id: 987654, item_id: 206, price: 810000, quantity: 9 }] },
+    206
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, 987654);
+  assert.equal(rows[0].price, 810000);
+});
+
+test('reads a map keyed by seller id', () => {
+  const rows = s.normaliseBazaarRows(
+    { bazaar: { '1234567': { cost: 800000, quantity: 5 } } },
+    206
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, 1234567, 'the key is the seller');
+  assert.equal(rows[0].qty, 5);
+});
+
+test('never mistakes the item id for a seller id', () => {
+  // A user's own bazaar lists items as {ID: <item id>}; reading that as a
+  // player would send us looking up item 206 as a person.
+  const rows = s.normaliseBazaarRows(
+    { bazaar: [{ ID: 206, name: 'Xanax', quantity: 5, price: 800000 }] },
+    206
+  );
+  assert.deepEqual(rows, []);
+});
+
+test('keeps the seller name when the listing carries one', () => {
+  const rows = s.normaliseBazaarRows(
+    { listings: [{ player_id: 555, player_name: 'Amara20', price: 830000, quantity: 3 }] },
+    206
+  );
+  assert.equal(rows[0].name, 'Amara20');
+});
+
+test('de-duplicates a seller listed several times', () => {
+  const rows = s.normaliseBazaarRows(
+    {
+      bazaar: [
+        { player_id: 555, price: 830000, quantity: 3 },
+        { player_id: 555, price: 840000, quantity: 2 }
+      ]
+    },
+    206
+  );
+  assert.equal(rows.length, 1);
+});
+
+test('digs listings out of a nested wrapper', () => {
+  const rows = s.normaliseBazaarRows(
+    { data: { bazaar: [{ player_id: 42, price: 1, quantity: 1 }] } },
+    206
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].id, 42);
+});
+
+test('an unrecognised shape yields no rows rather than junk ids', () => {
+  assert.deepEqual(s.normaliseBazaarRows({ bazaar: [{ note: 'nothing useful' }] }, 206), []);
+  assert.deepEqual(s.normaliseBazaarRows(null, 206), []);
+  assert.deepEqual(s.normaliseBazaarRows({ bazaar: 'nope' }, 206), []);
+});
+
+test('reads where a player lives from a v2 property payload', () => {
+  assert.equal(
+    s.propertyLabel({ properties: { 1: { name: 'Castle', upgrades: ['vault'] } } }),
+    'Castle'
+  );
+  assert.equal(s.propertyLabel({ properties: { 7: { property: 'Trailer' } } }), 'Trailer');
+  assert.equal(s.propertyLabel(null), null);
+  assert.equal(s.propertyLabel({ properties: {} }), null);
 });
 
 /* ------------------------------------------------------------------ */
@@ -134,27 +432,306 @@ test('survives an empty or malformed bazaar', () => {
 test('the estimate follows the mug-and-keep-the-goods model', () => {
   const subject = {
     money: 0,
-    bazaar: { buyout: 1000000, dealBuyout: 0, marketValue: 1000000 }
+    listingSummary: {
+      buyout: 1000000,
+      dealBuyout: 0,
+      marketValue: 1000000,
+      buyableBuyout: 1000000,
+      buyableMarketValue: 1000000
+    }
   };
-  const econ = { mugPct: 0.9, factionCut: 0, liquidation: 1, basket: 'all' };
+  const econ = { mugMerits: 0, factionCut: 0, liquidation: 1 };
 
   const est = s.estimateEconomics(subject, econ);
   assert.equal(est.spend, 1000000);
-  assert.equal(est.mugTake, 900000);
-  assert.equal(est.net, -100000 + 1000000, 'mug back 900k, keep 1m of goods');
+  // The game's formula: 23 - ln(1e6) = 9.18%, floored.
+  assert.equal(est.mugPercent, 9.18);
+  assert.equal(est.mugTake, 91800);
+  assert.equal(est.net, 91800, 'mug 91.8k, hand back the same 1m in goods');
 });
 
 test('the faction cut reduces the take', () => {
-  const subject = { money: 0, bazaar: { buyout: 0, dealBuyout: 0, marketValue: 0 } };
+  const subject = {
+    money: 0,
+    listingSummary: {
+      buyout: 0,
+      dealBuyout: 0,
+      marketValue: 0,
+      buyableBuyout: 0,
+      buyableMarketValue: 0
+    }
+  };
   const est = s.estimateEconomics(subject, {
-    mugPct: 1, factionCut: 0.5, liquidation: 1, basket: 'all'
+    mugPct: 1, factionCut: 0.5, liquidation: 1
   });
   assert.equal(est.net, 0);
 });
 
 /* ------------------------------------------------------------------ */
-/* Evaluation                                                          */
+/* Shared fixtures for the loot arithmetic                             */
 /* ------------------------------------------------------------------ */
+
+/* The bazaar from the report, in the shape that used to parse as empty. */
+const FIVE_ITEMS = [
+  { ID: 1, name: 'Hydrogen Tank', quantity: 6, price: 25760, market_price: 23000 },
+  { ID: 2, name: 'Spy Camera', quantity: 3, price: 492, market_price: 480 },
+  { ID: 3, name: 'Methane Tank', quantity: 2, price: 23252, market_price: 23000 },
+  { ID: 4, name: 'Pangolin Scales', quantity: 18, price: 205000, market_price: 205000 },
+  { ID: 5, name: 'Single Red Rose', quantity: 1, price: 414, market_price: 400 }
+];
+
+const ECON = { mugMerits: 0, factionCut: 0, liquidation: 1 };
+
+/** A subject as a scan would build one for an item search. */
+function listingSubject(price, marketPrice, qty) {
+  const listing = { itemName: 'E-DVD', price: price, qty: qty, marketPrice: marketPrice };
+  const summary = s.summariseBazaar(
+    [{ name: listing.itemName, price: price, quantity: qty, market_price: marketPrice }],
+    {}
+  );
+  return { value: summary.buyout, listing: listing, listingSummary: summary };
+}
+
+test('paying above market turns a profit into a loss', () => {
+  // The case that started this: an item listed at 5m against a 4m market.
+  const at = (price) => s.estimateEconomics(listingSubject(price, 4000000, 1), ECON);
+
+  const market = at(4000000);
+  assert.equal(market.mugPercent, 7.8);
+  assert.equal(market.unitDifference, 0, 'nothing gained or lost at market');
+  assert.equal(market.net, 312000, 'so the mug is the whole profit');
+
+  const over = at(5000000);
+  assert.equal(over.mugPercent, 7.58);
+  assert.equal(over.unitDifference, -1000000, 'the overpay is a per-item loss');
+  assert.equal(over.net, -621000, 'overpaying is a clear loss');
+});
+
+test('the loss grows with the overpay', () => {
+  const nets = [4000000, 5000000, 6000000].map(
+    (p) => s.estimateEconomics(listingSubject(p, 4000000, 1), ECON).net
+  );
+  assert.ok(nets[0] > nets[1] && nets[1] > nets[2], `monotonically worse: ${nets}`);
+});
+
+test('mugging merits scale the take but cannot rescue an overpay', () => {
+  const at = (price, merits) =>
+    s.estimateEconomics(listingSubject(price, 4000000, 1), {
+      mugMerits: merits,
+      factionCut: 0,
+      liquidation: 1
+    });
+
+  // Merits roughly double the take at 10 points.
+  assert.equal(at(4000000, 0).mugTake, 312000);
+  assert.equal(at(4000000, 10).mugTake, 624000);
+
+  // Even fully merited, overpaying by 25% still loses money here.
+  assert.ok(at(5000000, 10).net < 0, 'a maxed merit does not make a bad price good');
+});
+
+/* ------------------------------------------------------------------ */
+/* Estimate model                                                      */
+/* ------------------------------------------------------------------ */
+
+test('a bazaar is read whether it arrives as an array or a map', () => {
+  assert.equal(s.normaliseUser({ bazaar: FIVE_ITEMS }).bazaar.length, 5, 'array form');
+  assert.equal(
+    s.normaliseUser({ bazaar: { items: FIVE_ITEMS } }).bazaar.length,
+    5,
+    'wrapped form'
+  );
+
+  const map = {};
+  FIVE_ITEMS.forEach((it, i) => {
+    map[String(i + 1)] = it;
+  });
+  const asMap = s.normaliseUser({ bazaar: map }).bazaar;
+  assert.equal(asMap.length, 5, 'map keyed by item id');
+  assert.equal(asMap[3].name, 'Pangolin Scales', 'and the rows survive intact');
+});
+
+test('toItemArray copes with anything rather than throwing', () => {
+  assert.deepEqual(s.toItemArray(null), []);
+  assert.deepEqual(s.toItemArray(undefined), []);
+  assert.deepEqual(s.toItemArray('nonsense'), []);
+  assert.deepEqual(s.toItemArray(42), []);
+  assert.equal(s.toItemArray(FIVE_ITEMS).length, 5);
+});
+
+test('only the searched item is valued, not the whole bazaar', () => {
+  // The report's bazaar: 18 pangolin scales plus 12 other items.
+  const subject = s.buildSubject(4425009, { bazaar: FIVE_ITEMS }, null, null, null, 4);
+
+  assert.equal(subject.bazaar.buyout, 6 * 25760 + 3 * 492 + 2 * 23252 + 18 * 205000 + 414);
+  assert.equal(subject.itemSummary.itemLines, 1, 'one line: the item searched');
+  assert.equal(subject.itemSummary.buyout, 18 * 205000, '18 x 205,000 only');
+  assert.equal(subject.value, 3690000, 'the rest of their stock is excluded');
+  assert.equal(subject.valueSource, 'bazaar line');
+
+  // And the loot follows the same figure.
+  const d = s.lootBreakdown(subject);
+  assert.equal(d.spend, 3690000);
+  assert.equal(d.net, s.mugTake(3690000, 0), 'at market, the mug is the profit');
+});
+
+test('a different item in the same bazaar gives a different figure', () => {
+  const scales = s.buildSubject(1, { bazaar: FIVE_ITEMS }, null, null, null, 4);
+  const chocolate = s.buildSubject(1, { bazaar: FIVE_ITEMS }, null, null, null, 1);
+  assert.notEqual(scales.value, chocolate.value, 'each item is its own figure');
+  assert.equal(scales.value, 3690000);
+});
+
+test('without an item selected there is nothing to value', () => {
+  // A page scan has no item context, so no profit can be claimed.
+  const subject = s.buildSubject(1, { bazaar: FIVE_ITEMS }, null, null, null, null);
+  assert.equal(subject.value, 0);
+  assert.equal(subject.valueUnknown, true);
+  assert.equal(subject.valueUnknownReason, 'no item selected');
+  assert.equal(s.lootBreakdown(subject).net, 0, 'and no profit is invented');
+});
+
+test('a bazaar Torn declined to send is flagged, not reported as empty', () => {
+  const torn = { player_id: 1, name: 'X', bazaar: [], __tbmsSelections: 'profile,basic' };
+  const subject = s.buildSubject(1, torn, null, null, null);
+
+  assert.equal(subject.bazaarRead, false);
+  assert.equal(subject.valueUnknown, true, 'we must not claim they have nothing');
+  assert.equal(subject.value, 0, 'the number is still zero');
+});
+
+test('a bazaar that came back empty is a real answer', () => {
+  const torn = { player_id: 1, name: 'X', bazaar: [], __tbmsSelections: 'profile,basic,bazaar' };
+  const subject = s.buildSubject(1, torn, null, null, null, 4);
+
+  assert.equal(subject.bazaarRead, true, 'the bazaar was read, and it was empty');
+  assert.equal(subject.valueUnknown, true, 'so the item cannot be valued');
+  assert.equal(subject.valueUnknownReason, 'that item is not in their bazaar');
+});
+
+test('a listing still counts even when the bazaar was not returned', () => {
+  const listing = {
+    itemId: 780,
+    itemName: 'Pangolin Scales',
+    price: 205000,
+    qty: 18,
+    marketPrice: 205000
+  };
+  const subject = s.buildSubject(
+    1,
+    { player_id: 1, name: 'X', __tbmsSelections: 'profile,basic' },
+    null,
+    null,
+    listing
+  );
+  assert.equal(subject.valueUnknown, false, 'the listing answers the question');
+  assert.equal(subject.value, 3690000);
+});
+
+test('an unvalued seller passes the value filter rather than being blamed', () => {
+  // A missing measurement is not a seller holding nothing. Failing them on
+  // it would reject every row a page scan turned up.
+  const subject = makeSubject({
+    value: 0,
+    valueUnknown: true,
+    valueUnknownReason: 'the listing came back without a price and quantity',
+    listing: null,
+    listingSummary: null,
+    itemSummary: null,
+    bazaar: s.summariseBazaar([], {})
+  });
+  const cfg = settingsWith((c) => {
+    c.filters.minBazaarValue.on = true;
+    c.filters.minBazaarValue.value = 1000000;
+  });
+  const v = s.evaluateTarget(subject, { settings: cfg });
+
+  assert.equal(v.verdict, 'match', JSON.stringify(v.reasons));
+  assert.ok(v.positives.includes('value not returned'), 'and says why');
+});
+
+test('a seller found by a listing is judged on that listing, not their bazaar', () => {
+  // The reported case: 30 pangolin scales at the going rate, in Torn and
+  // out of hospital, vault ignored - but their bazaar lookup came back
+  // empty, so judging them on their bazaar scored them at zero.
+  const emptyBazaar = s.summariseBazaar([], {});
+  const listing = { itemId: 780, itemName: 'Pangolin Scales', price: 40000, qty: 30, marketPrice: 40000 };
+  const listingSummary = s.summariseBazaar(
+    [{ name: listing.itemName, price: listing.price, quantity: listing.qty, market_price: listing.marketPrice }],
+    { priceLimitPct: 100 }
+  );
+
+  const subject = makeSubject({
+    id: 1639224,
+    name: 'starbug',
+    bazaar: emptyBazaar,
+    listing: listing,
+    listingSummary: listingSummary,
+    value: listingSummary.buyout,
+    valueSource: 'listing',
+    ff: { fairFight: 1.94, bsEstimate: 211100, source: 'bss' }
+  });
+
+  const v = s.evaluateTarget(subject, { settings: settingsWith() });
+
+  assert.equal(subject.listingSummary.buyout, 1200000, '30 x 40k on the table');
+  assert.equal(v.verdict, 'match', 'so it is a hit: ' + JSON.stringify(v.reasons));
+  assert.ok(
+    v.positives.some((p) => /loot|stats|In Torn/.test(p)),
+    'and it reports something positive: ' + JSON.stringify(v.positives)
+  );
+});
+
+test('an empty bazaar no longer reads as an empty bank', () => {
+  // The old failure mode: bazaar empty -> value 0 -> rejected on value.
+  const subject = makeSubject({
+    bazaar: s.summariseBazaar([], {}),
+    listing: { itemId: 780, itemName: 'Pangolin Scales', price: 40000, qty: 30, marketPrice: 40000 },
+    listingSummary: s.summariseBazaar(
+      [{ price: 40000, quantity: 30, market_price: 40000 }],
+      { priceLimitPct: 100 }
+    ),
+    value: 1200000
+  });
+  const v = s.evaluateTarget(subject, { settings: settingsWith() });
+  assert.equal(v.verdict, 'match', JSON.stringify(v.reasons));
+});
+
+test('nothing anywhere still means no sale to buy', () => {
+  const subject = makeSubject({
+    bazaar: s.summariseBazaar([], {}),
+    listing: null,
+    listingSummary: null,
+    value: 0
+  });
+  const v = s.evaluateTarget(subject, {
+    settings: settingsWith((c) => {
+      c.filters.minBazaarValue.on = true;
+      c.filters.minBazaarValue.value = 1000000;
+    })
+  });
+  assert.equal(v.verdict, 'reject');
+  assert.ok(v.reasons.some((r) => /on sale/.test(r)), JSON.stringify(v.reasons));
+});
+
+test('the estimate spends the listing price, not a whole-bazaar basket', () => {
+  const listingSummary = s.summariseBazaar(
+    [{ price: 40000, quantity: 30, market_price: 40000 }],
+    { priceLimitPct: 100 }
+  );
+  const est = s.estimateEconomics(
+    { money: 99999999, listingSummary: listingSummary, bazaar: s.summariseBazaar([], {}) },
+    { mugMerits: 0, factionCut: 0, liquidation: 1 }
+  );
+
+  assert.equal(est.spend, 1200000, '30 x 40k');
+  // The mug is computed on what you hand over, since their own cash is
+  // never visible - note the ignored money field above.
+  assert.equal(est.mugTargetCash, 1200000);
+  // 23 - ln(1,200,000) = 9.0022 -> 9.00%, floored to 108,000.
+  assert.equal(est.mugPercent, 9);
+  assert.equal(est.mugGross, 108000);
+});
 
 function makeSubject(overrides = {}) {
   const base = {
@@ -164,10 +741,34 @@ function makeSubject(overrides = {}) {
     factionId: 999,
     status: s.readStatus({ status: { state: 'Okay', description: 'Okay' } }),
     lastActionAgo: 60,
-    money: 5000000,
-    moneyExposed: true,
     publicBs: null,
     vault: { hasVault: false, vaultAmount: null },
+    // The money that moves: what they have on sale, which for an item scan
+    // is the listing we found them through.
+    listing: { itemId: 206, itemName: 'Xanax', price: 800000, qty: 60, marketPrice: 850000 },
+    listingSummary: {
+      items: [],
+      itemLines: 1,
+      count: 60,
+      buyout: 48000000,
+      marketValue: 51000000,
+      worthyCount: 60,
+      worthyBuyout: 48000000,
+      dealCount: 60,
+      dealBuyout: 48000000,
+      buyableCount: 60,
+      buyableBuyout: 48000000,
+      buyableMarketValue: 51000000,
+      overCount: 0,
+      overBuyout: 0,
+      overMarketValue: 0,
+      overpayAmount: 0,
+      worstOverpayPct: 0,
+      unpricedLines: 0,
+      topItem: { name: 'Xanax', value: 48000000, qty: 60, price: 800000 }
+    },
+    value: 48000000,
+    valueSource: 'listing',
     bazaar: {
       items: [],
       itemLines: 5,
@@ -340,7 +941,7 @@ test('battle-stat and fair-fight ceilings both bite', () => {
   const strongBs = makeSubject({ ff: { fairFight: 1.0, bsEstimate: 9000000, source: 'bss' } });
   const v2 = s.evaluateTarget(strongBs, { settings: settingsWith() });
   assert.equal(v2.verdict, 'reject');
-  assert.ok(v2.reasons.some((r) => r.startsWith('BS')), JSON.stringify(v2.reasons));
+  assert.ok(v2.reasons.some((r) => r.startsWith('stats')), JSON.stringify(v2.reasons));
 });
 
 test('the multiplier makes the stat comparison tunable', () => {
@@ -400,28 +1001,6 @@ test('an unset battle-stat yardstick fails loudly rather than passing', () => {
   assert.ok(v.reasons.includes('your stats not set'));
 });
 
-test('money threshold rejects a broke seller but tolerates hidden cash', () => {
-  const broke = makeSubject({ money: 0 });
-  const v = s.evaluateTarget(broke, {
-    settings: settingsWith((cfg) => {
-      cfg.filters.minMoney.on = true;
-      cfg.filters.minMoney.value = 1000000;
-    })
-  });
-  assert.equal(v.verdict, 'reject');
-
-  // Torn hides other players' cash on some key types; that must not be
-  // silently treated as "has plenty" or as a hard failure.
-  const hidden = makeSubject({ money: null, moneyExposed: false });
-  const v2 = s.evaluateTarget(hidden, {
-    settings: settingsWith((cfg) => {
-      cfg.filters.minMoney.on = true;
-      cfg.filters.minMoney.value = 1000000;
-    })
-  });
-  assert.equal(v2.verdict, 'match', JSON.stringify(v2.reasons));
-});
-
 test('min score filter is applied last and is toggleable', () => {
   const v = s.evaluateTarget(makeSubject(), {
     settings: settingsWith((cfg) => {
@@ -439,6 +1018,72 @@ test('min score filter is applied last and is toggleable', () => {
 /* Subject building                                                    */
 /* ------------------------------------------------------------------ */
 
+/* --- API v1 vs v2 payload shapes -----------------------------------
+ * v1 merges every selection into one flat object; v2 nests them. Reading
+ * only one shape is what produced nameless rows in the wild.
+ */
+const V1_FLAT_USER = {
+  player_id: 1234567,
+  name: 'Flat Sam',
+  level: 33,
+  faction_id: 777,
+  status: { state: 'Hospital', description: 'In hospital', until: 9999999999 },
+  last_action: { timestamp: Math.floor(Date.now() / 1000) - 300, relative: '5 minutes ago' },
+  strength: 10,
+  speed: 20,
+  dexterity: 30,
+  defense: 40,
+  bazaar: [{ name: 'Xanax', quantity: 3, price: 800000, market_price: 900000 }]
+};
+
+const V2_NESTED_USER = {
+  profile: { id: 1234567, name: 'Nested Nina', level: 44 },
+  basic: { player_id: 1234567, name: 'Nested Nina', faction_id: 888 },
+  stats: { strength: 5, speed: 5, dexterity: 5, defense: 5, total: 20 },
+  money: { money_onhand: 5000000 },
+  status: { state: 'Okay', description: 'Okay' },
+  bazaar: []
+};
+
+test('reads a v1 flat user payload', () => {
+  const u = s.normaliseUser(V1_FLAT_USER);
+  assert.equal(u.name, 'Flat Sam', 'name sits at the top level in v1');
+  assert.equal(u.level, 33);
+  assert.equal(u.factionId, 777);
+  assert.equal(u.status.state, 'Hospital');
+  assert.ok(u.lastAction > 0, 'last_action.timestamp is read, not the object');
+  assert.equal(u.stats.total, 100);
+});
+
+test('reads a v2 nested user payload', () => {
+  const u = s.normaliseUser(V2_NESTED_USER);
+  assert.equal(u.name, 'Nested Nina');
+  assert.equal(u.level, 44);
+  assert.equal(u.factionId, 888);
+  assert.equal(u.stats.total, 20);
+});
+
+test('a v1 flat payload produces a properly named, located subject', () => {
+  const subject = s.buildSubject(1234567, V1_FLAT_USER, null);
+  assert.equal(subject.name, 'Flat Sam', 'not "Player 1234567"');
+  assert.equal(subject.status.state, 'Hospital');
+  assert.equal(subject.status.isHospital, true);
+  assert.equal(subject.publicBs, 100);
+  assert.ok(subject.lastActionAgo >= 290 && subject.lastActionAgo <= 320, 'seen ~5m ago');
+  assert.equal(subject.bazaar.buyout, 2400000);
+});
+
+test('the last action object is not mistaken for a timestamp', () => {
+  // Reading the object directly used to produce NaN -> "unknown".
+  const subject = s.buildSubject(1, V1_FLAT_USER, null);
+  assert.notEqual(subject.lastActionAgo, null);
+});
+
+test('readStatus accepts a bare status object as well as a payload', () => {
+  assert.equal(s.readStatus({ state: 'Abroad' }).isAbroad, true);
+  assert.equal(s.readStatus({ status: { state: 'Abroad' } }).isAbroad, true);
+});
+
 test('builds a subject from a Torn user payload', () => {
   const torn = {
     profile: { name: 'Seller', level: 42, last_action: 0 },
@@ -455,7 +1100,6 @@ test('builds a subject from a Torn user payload', () => {
   assert.equal(subject.level, 42);
   assert.equal(subject.factionId, 777);
   assert.equal(subject.publicBs, 400);
-  assert.equal(subject.money, 2500000);
   assert.equal(subject.bazaar.buyout, 2400000);
   assert.equal(subject.vault.hasVault, true);
   assert.equal(subject.ff.fairFight, 1.5);
@@ -480,6 +1124,10 @@ test('hidden battle stats fall back to the FF estimate', () => {
 
 /* ------------------------------------------------------------------ */
 /* Helpers / settings migration                                        */
+/* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* The packed "already checked" record                                 */
 /* ------------------------------------------------------------------ */
 
 test('parses the numeric shapes Torn returns', () => {

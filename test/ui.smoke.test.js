@@ -129,7 +129,7 @@ const SEED_SETTINGS = {
   ui: { open: true, tab: 'scan', onlyMatches: false, fabPos: null }
 };
 
-function boot(seedSettings) {
+function boot(seedSettings, extraKeys) {
   const dom = new JSDOM(PAGE_HTML, {
     url: 'https://www.torn.com/bazaar.php',
     runScripts: 'outside-only',
@@ -141,6 +141,8 @@ function boot(seedSettings) {
   if (seedSettings !== null) {
     store.set('settings', JSON.stringify(seedSettings || SEED_SETTINGS));
   }
+  // Anything else that should already exist at startup (watchlist, cache).
+  Object.keys(extraKeys || {}).forEach((k) => store.set(k, extraKeys[k]));
   const calls = [];
 
   win.GM_getValue = (k, def) => (store.has(k) ? store.get(k) : def);
@@ -163,7 +165,7 @@ function boot(seedSettings) {
         total_count: 4,
         items: Object.keys(ITEMS).map((id) => ({ item_id: Number(id), item_name: ITEMS[id].name }))
       });
-    } else if (/market\/(\d+)\?selections=bazaar/.test(opts.url)) {
+    } else if (/v2\/market\/(\d+)\/bazaar/.test(opts.url)) {
       body = JSON.stringify({ bazaar: [{ ID: 1111111, cost: 800000, quantity: 30 }] });
     } else {
       const torn = opts.url.match(/api\.torn\.com\/user\/(\d+)\?/);
@@ -224,6 +226,14 @@ function waitFor(fn, timeoutMs = 5000, label = 'condition') {
  * inline geometry the drag/resize handlers write - otherwise reading the
  * rect back at mouseup would always return the starting values.
  */
+/**
+ * Result rows only. The Watch tab draws a table with the same classes, so an
+ * unscoped query would silently count both.
+ */
+function resultRows(doc) {
+  return doc.querySelectorAll('section[data-tab="results"] table.tbms-table tbody tr');
+}
+
 function stubLayout(panel, base) {
   const start = Object.assign({ left: 400, top: 100, width: 700, height: 500 }, base || {});
   panel.getBoundingClientRect = () => {
@@ -244,8 +254,8 @@ t('mounts the floating button and panel into the page', () => {
   assert.ok(doc.getElementById('tbms-root'), 'root mounted');
   assert.ok(doc.getElementById('tbms-fab'), 'floating button present');
   assert.ok(doc.getElementById('tbms-panel'), 'panel present');
-  assert.equal(doc.querySelectorAll('.tbms-tab').length, 4, 'four tabs');
-  assert.equal(doc.querySelectorAll('section[data-tab]').length, 4, 'four tab panels');
+  assert.equal(doc.querySelectorAll('.tbms-tab').length, 5, 'five tabs');
+  assert.equal(doc.querySelectorAll('section[data-tab]').length, 5, 'five tab panels');
   dom.window.close();
 });
 
@@ -277,7 +287,7 @@ t('a full scan finds the one good target and rejects the rest', async () => {
 
   const rows = await waitFor(
     () => {
-      const r = doc.querySelectorAll('table.tbms-table tbody tr');
+      const r = resultRows(doc);
       return r.length === 3 ? r : null;
     },
     8000,
@@ -300,13 +310,21 @@ t('a full scan finds the one good target and rejects the rest', async () => {
 
   // The rejection reasons must be legible in the table, not just implied.
   assert.match(byName.Bob.textContent, /abroad/i);
-  assert.match(byName.Carol.textContent, /FF|BS/);
+  assert.match(byName.Carol.textContent, /fair fight|stats/i, 'the screen states its reason');
 
-  // One batched FFScouter call, one Torn call per seller.
+  // One batched FFScouter call. Torn is only spent on the survivors of the
+  // strength screen, so Carol (FF 9.4 / 680m) never costs a request.
   const ffCalls = calls.filter((u) => u.includes('ffscouter'));
   const tornCalls = calls.filter((u) => u.includes('api.torn.com/user/'));
   assert.equal(ffCalls.length, 1, 'FFScouter is batched into a single request');
-  assert.equal(tornCalls.length, 3, 'one Torn lookup per seller');
+  assert.equal(tornCalls.length, 2, 'Torn is only asked about the survivors');
+  assert.ok(
+    !tornCalls.some((u) => /user\/3333333\?/.test(u)),
+    'the too-strong seller never reached Torn'
+  );
+  // …but she is still shown, with the reason, rather than vanishing.
+  assert.ok(byName.Carol, 'screened-out sellers still get a row');
+  assert.match(byName.Carol.textContent, /screened out/i, 'labelled as screened out');
 
   const badge = doc.getElementById('tbms-badge');
   assert.ok(badge.classList.contains('tbms-show'), 'badge is shown');
@@ -320,7 +338,7 @@ t('re-scores instantly from cache when filters change', async () => {
   const doc = win.document;
 
   doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
-  await waitFor(() => doc.querySelectorAll('table.tbms-table tbody tr').length === 3, 8000, 'first scan');
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'first scan');
 
   const callsAfterScan = calls.length;
 
@@ -346,10 +364,19 @@ t('re-scores instantly from cache when filters change', async () => {
   rescore.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
 
   await waitFor(
-    () => doc.querySelectorAll('table.tbms-table tbody tr.tbms-match').length === 3,
+    () => Array.from(resultRows(doc)).filter((tr) => tr.classList.contains('tbms-match')).length === 2,
     3000,
-    'all three to become matches'
+    'the checked sellers to become matches'
   );
+
+  // The screened-out seller stays rejected and must NOT be re-imagined as a
+  // player with an empty bazaar; she needs a scan to be judged at all.
+  const carol = Array.from(resultRows(doc)).find((tr) =>
+    /Carol/.test(tr.textContent)
+  );
+  assert.ok(carol, 'she is still listed');
+  assert.ok(carol.classList.contains('tbms-reject'), 'and still rejected');
+  assert.match(carol.textContent, /not checked|screened out/i, 'with an honest reason');
 
   assert.equal(calls.length, callsAfterScan, 're-scoring made no further API calls');
   dom.window.close();
@@ -409,7 +436,8 @@ t('the setup button stores your key and loads your own stats', async () => {
   const { dom, win, store } = boot(null); // brand new install
   const doc = win.document;
 
-  const keyInput = doc.querySelector('section[data-tab="setup"] input[type="password"]');
+  const keyInput = doc.getElementById('tbms-torn-key');
+  assert.ok(keyInput, 'key field found');
   keyInput.value = 'abcdefghijklmnop';
   keyInput.dispatchEvent(new win.Event('change', { bubbles: true }));
 
@@ -446,17 +474,20 @@ t('a manually entered ID list drives a scan', async () => {
   goBtn.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
 
   const row = await waitFor(
-    () => doc.querySelector('table.tbms-table tbody tr'),
+    () => resultRows(doc)[0],
     5000,
     'a result row for the manual id'
   );
 
-  assert.equal(doc.querySelectorAll('table.tbms-table tbody tr').length, 1, 'only the requested player');
+  assert.equal(resultRows(doc).length, 1, 'only the requested player');
   assert.match(row.textContent, /Carol/, 'it is the right player');
+  // Carol is far too strong for the default filters, so the cheap screen
+  // settles her without a Torn request - and says so in the row.
   assert.ok(
-    calls.some((u) => /api\.torn\.com\/user\/3333333\?/.test(u)),
-    'Torn was asked about 3333333'
+    !calls.some((u) => /api\.torn\.com\/user\/3333333\?/.test(u)),
+    'no Torn request was spent on a player the screen already ruled out'
   );
+  assert.match(row.textContent, /screened out/i, 'the row explains why');
   dom.window.close();
 });
 
@@ -465,7 +496,7 @@ t('export buttons do not throw when the clipboard is unavailable', async () => {
   const doc = win.document;
 
   doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
-  await waitFor(() => doc.querySelectorAll('table.tbms-table tbody tr').length === 3, 8000, 'scan');
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
 
   doc.querySelector('.tbms-tab[data-tab="results"]').dispatchEvent(
     new win.MouseEvent('click', { bubbles: true })
@@ -481,7 +512,7 @@ t('export buttons do not throw when the clipboard is unavailable', async () => {
   });
 
   assert.ok(doc.getElementById('tbms-panel'), 'panel still alive after export attempts');
-  assert.equal(doc.querySelectorAll('table.tbms-table tbody tr').length, 3, 'table intact');
+  assert.equal(resultRows(doc).length, 3, 'table intact');
   dom.window.close();
 });
 
@@ -490,7 +521,7 @@ t('clearing the cache actually empties stored player data', async () => {
   const doc = win.document;
 
   doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
-  await waitFor(() => doc.querySelectorAll('table.tbms-table tbody tr').length === 3, 8000, 'scan');
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
 
   const cached = JSON.parse(store.get('cache_v1') || '{}');
   assert.ok(Object.keys(cached).length > 0, 'players were cached by the scan');
@@ -512,7 +543,7 @@ t('never scans your own id, even on your own bazaar page', async () => {
   // Pretend player 1111111 is us, and that we are standing on their page.
   const seed = JSON.parse(JSON.stringify(SEED_SETTINGS));
   seed.me.id = 1111111;
-  const { dom, win, calls } = boot(seed);
+  const { dom, win, calls, store } = boot(seed);
   const doc = win.document;
 
   assert.equal(
@@ -522,14 +553,14 @@ t('never scans your own id, even on your own bazaar page', async () => {
   );
 
   doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
-  await waitFor(() => doc.querySelectorAll('table.tbms-table tbody tr').length === 2, 8000, 'scan');
+  await waitFor(() => resultRows(doc).length === 2, 8000, 'scan');
 
   assert.ok(
     !calls.some((u) => /api\.torn\.com\/user\/1111111\?/.test(u)),
     'Torn was never asked about our own id'
   );
   assert.ok(
-    !Array.from(doc.querySelectorAll('table.tbms-table tbody tr')).some((tr) =>
+    !Array.from(resultRows(doc)).some((tr) =>
       /Alice/.test(tr.textContent)
     ),
     'we are not in our own results'
@@ -599,7 +630,7 @@ t('footer opener toggles the panel and carries the match badge', async () => {
   assert.equal(visible(), true, 'click reopens it');
 
   doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
-  await waitFor(() => doc.querySelectorAll('table.tbms-table tbody tr').length === 3, 8000, 'scan');
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
 
   const badge = doc.getElementById('tbms-footer-badge');
   assert.ok(badge.classList.contains('tbms-show'), 'badge visible after a scan');
@@ -688,7 +719,7 @@ t('scans an item\'s bazaar sellers from data, not from the page', async () => {
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
     return function (opts) {
-      if (/market\/206\?selections=bazaar/.test(opts.url)) {
+      if (/v2\/market\/206\/bazaar/.test(opts.url)) {
         calls.push(opts.url);
         setTimeout(
           () =>
@@ -716,7 +747,7 @@ t('scans an item\'s bazaar sellers from data, not from the page', async () => {
 
   const rows = await waitFor(
     () => {
-      const r = doc.querySelectorAll('table.tbms-table tbody tr');
+      const r = resultRows(doc);
       return r.length === 2 ? r : null;
     },
     9000,
@@ -724,7 +755,7 @@ t('scans an item\'s bazaar sellers from data, not from the page', async () => {
   );
   assert.equal(rows.length, 2, 'both bazaar sellers were checked');
   assert.ok(
-    calls.some((u) => /market\/206\?selections=bazaar/.test(u)),
+    calls.some((u) => /v2\/market\/206\/bazaar/.test(u)),
     'Torn bazaar listings were requested for the item'
   );
   assert.ok(
@@ -748,7 +779,7 @@ t('falls back to the community scanner when Torn lists nothing', async () => {
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
     return function (opts) {
-      if (/market\/206\?selections=bazaar/.test(opts.url)) {
+      if (/v2\/market\/206\/bazaar/.test(opts.url)) {
         calls.push(opts.url);
         // Torn knows of no bazaar offers; the scanner does.
         setTimeout(() => opts.onload({ status: 200, responseText: JSON.stringify({ bazaar: [] }) }), 0);
@@ -781,10 +812,10 @@ t('falls back to the community scanner when Torn lists nothing', async () => {
   doc.getElementById('tbms-item-input').value = '206';
   doc.getElementById('tbms-item-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
 
-  await waitFor(() => doc.querySelectorAll('table.tbms-table tbody tr').length === 1, 9000, 'scanner result');
+  await waitFor(() => resultRows(doc).length === 1, 9000, 'scanner result');
   assert.ok(calls.some((u) => /weav3r\.dev/.test(u)), 'the scanner was consulted');
 
-  const row = doc.querySelector('table.tbms-table tbody tr');
+  const row = resultRows(doc)[0];
   assert.match(row.textContent, /Bob/, 'the seller from the scanner was checked');
   dom.window.close();
 });
@@ -798,7 +829,7 @@ t('the third-party source can be switched off entirely', async () => {
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
     return function (opts) {
-      if (/market\/206\?selections=bazaar/.test(opts.url)) {
+      if (/v2\/market\/206\/bazaar/.test(opts.url)) {
         calls.push(opts.url);
         setTimeout(() => opts.onload({ status: 200, responseText: JSON.stringify({ bazaar: [] }) }), 0);
         return;
@@ -925,8 +956,8 @@ t('key check names the exact selection a Limited key is needed for', async () =>
         );
         return;
       }
-      // Pretend the key is too weak for other players' property and money.
-      if (/selections=property/.test(opts.url) || /selections=money/.test(opts.url)) {
+      // Pretend the key is too weak for another player's property.
+      if (/v2\/user\/\d+\/property/.test(opts.url)) {
         setTimeout(
           () =>
             opts.onload({
@@ -973,6 +1004,1142 @@ t('the setup tab states which access level to use', () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* API key fields must not look like logins to the browser             */
+/* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* Watchlist                                                           */
+/* ------------------------------------------------------------------ */
+
+/** Boot with a watchlist already stored, as after a reload. */
+function bootWatching(entries) {
+  return boot(SEED_SETTINGS, { watch_v1: JSON.stringify(entries) });
+}
+
+/** Serve one player's state, and let the test change it between checks. */
+function servePlayer(win, id, status, extra) {
+  win.GM_xmlhttpRequest = (() => {
+    const base = win.GM_xmlhttpRequest;
+    return function (opts) {
+      if (new RegExp('api\\.torn\\.com/user/' + id + '\\?').test(opts.url)) {
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify(
+                tornUser(id, Object.assign({ profile: { name: 'Watched', level: 30, status } }, extra || {}))
+              )
+            }),
+          0
+        );
+        return;
+      }
+      return base(opts);
+    };
+  })();
+}
+
+function watchRowText(doc) {
+  return doc.querySelector('section[data-tab="watch"]').textContent;
+}
+
+t('a watched player who goes back into hospital stops being ready', async () => {
+  // "Ready" used to be set once and never cleared, so somebody discharged
+  // and then hospitalised again stayed flagged as back for good.
+  const seeded = {
+    2222222: {
+      id: 2222222,
+      name: 'Watched',
+      state: 'Okay',
+      ready: true,
+      readyAt: Date.now(),
+      checkedAt: Date.now(),
+      bazaarValue: 1000000
+    }
+  };
+  const { dom, win } = bootWatching(seeded);
+  const doc = win.document;
+
+  // They are back in hospital with a long stay.
+  servePlayer(win, 2222222, {
+    state: 'Hospital',
+    description: 'In hospital',
+    until: Math.floor(Date.now() / 1000) + 3600
+  });
+
+  doc.querySelector('.tbms-tab[data-tab="watch"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  const check = Array.from(doc.querySelectorAll('section[data-tab="watch"] button')).find(
+    (b) => b.textContent === 'Check now'
+  );
+  check.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+
+  await waitFor(() => !/back now/.test(watchRowText(doc)), 6000, 'the ready flag to clear');
+  assert.match(watchRowText(doc), /Hospital/, 'and their new state is shown');
+  dom.window.close();
+});
+
+t('out of a foreign hospital is still abroad, so not a target', async () => {
+  // Discharged abroad means out of the country, not reachable. The countdown
+  // must not read as if they become attackable when it runs out.
+  const seeded = {
+    3333333: {
+      id: 3333333,
+      name: 'Watched',
+      state: 'Hospital',
+      until: Math.floor(Date.now() / 1000) - 10, // the stay is over
+      ready: false,
+      checkedAt: 0
+    }
+  };
+  const { dom, win } = bootWatching(seeded);
+  const doc = win.document;
+
+  // Out of hospital, but abroad.
+  servePlayer(win, 3333333, { state: 'Abroad', description: 'Abroad', until: 0 });
+
+  doc.querySelector('.tbms-tab[data-tab="watch"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  const check = Array.from(doc.querySelectorAll('section[data-tab="watch"] button')).find(
+    (b) => b.textContent === 'Check now'
+  );
+  check.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+
+  await waitFor(() => /Abroad/.test(watchRowText(doc)), 6000, 'the abroad state');
+  const text = watchRowText(doc);
+  assert.doesNotMatch(text, /back now/, 'they are not flagged as back');
+  assert.doesNotMatch(text, /attack/, 'and no attack link is offered');
+  assert.match(text, /still abroad/, 'the row says why they are not reachable');
+  dom.window.close();
+});
+
+t('a foreign hospital is still shown as abroad, not as available', async () => {
+  const seeded = {
+    3333333: {
+      id: 3333333,
+      name: 'Watched',
+      state: 'Hospital',
+      until: Math.floor(Date.now() / 1000) + 600,
+      ready: false,
+      abroad: true,
+      checkedAt: Date.now()
+    }
+  };
+  const { dom, win } = bootWatching(seeded);
+  const doc = win.document;
+
+  doc.querySelector('.tbms-tab[data-tab="watch"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  const text = watchRowText(doc);
+  assert.match(text, /Hospital/, 'their state is hospital');
+  assert.match(text, /still abroad/, 'with the abroad caveat alongside');
+  assert.doesNotMatch(text, /back now/);
+  dom.window.close();
+});
+
+/* ------------------------------------------------------------------ */
+/* Results card (the corner notification)                              */
+/* ------------------------------------------------------------------ */
+
+t('the scanner is asked for its maximum, not a number it rejects', async () => {
+  // The endpoint caps at 100 and answers anything above that with a 403
+  // carrying no JSON. Requesting 200 meant the scanner silently returned
+  // nothing, leaving only Torn's short list - which looked like the whole
+  // market and stalled a scan after about ten sellers.
+  const { dom, win, calls } = boot();
+  const doc = win.document;
+
+  await waitFor(() => doc.getElementById('tbms-item-input'), 3000, 'the picker');
+  doc.getElementById('tbms-item-input').value = '206';
+  doc.getElementById('tbms-item-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(
+    () => calls.some((u) => u.includes('weav3r.dev/api/marketplace/206')),
+    9000,
+    'the scanner to be asked'
+  );
+
+  const scannerCall = calls.find((u) => u.includes('weav3r.dev/api/marketplace/206'));
+  assert.match(scannerCall, /limit=100\b/, 'asked for the maximum: ' + scannerCall);
+  assert.doesNotMatch(scannerCall, /limit=200\b/, 'not for a number it refuses');
+  dom.window.close();
+});
+
+t('a bazaar page scan values the stock it can plainly see', async () => {
+  // Straight from the report: donhordking's bazaar, 18 pangolin scales at
+  // 205k, and the table said "$0 on sale". The bazaar arrived keyed by item
+  // id rather than as an array, and that parsed as empty.
+  const BAZAAR_MAP = {
+    1: { ID: 1, name: 'Hydrogen Tank', quantity: 6, price: 25760, market_price: 23000 },
+    2: { ID: 2, name: 'Spy Camera', quantity: 3, price: 492, market_price: 480 },
+    3: { ID: 3, name: 'Methane Tank', quantity: 2, price: 23252, market_price: 23000 },
+    4: { ID: 4, name: 'Pangolin Scales', quantity: 18, price: 205000, market_price: 205000 },
+    5: { ID: 5, name: 'Single Red Rose', quantity: 1, price: 414, market_price: 400 }
+  };
+
+  const page =
+    '<!doctype html><html><body>' +
+    '<div id="notes_panel_button" class="icon-wrap"><svg></svg></div>' +
+    '<a href="/bazaar.php?userId=4425009">donhordking</a>' +
+    '</body></html>';
+  const dom = new JSDOM(page, {
+    url: 'https://www.torn.com/bazaar.php?userId=4425009',
+    runScripts: 'outside-only',
+    pretendToBeVisual: true
+  });
+  const win = dom.window;
+  const store = new Map([['settings', JSON.stringify(SEED_SETTINGS)]]);
+  win.GM_getValue = (k, d) => (store.has(k) ? store.get(k) : d);
+  win.GM_setValue = (k, v) => store.set(k, v);
+  win.GM_addStyle = () => {};
+  win.GM_registerMenuCommand = () => {};
+  win.GM_xmlhttpRequest = function (o) {
+    let body = '{}';
+    if (/get-stats/.test(o.url)) {
+      body = JSON.stringify([
+        { player_id: 4425009, fair_fight: 1.19, bs_estimate: 8500, source: 'bss' }
+      ]);
+    } else if (/api\.torn\.com\/user\/4425009\?/.test(o.url)) {
+      body = JSON.stringify({
+        player_id: 4425009,
+        name: 'donhordking',
+        level: 17,
+        faction_id: 0,
+        status: { state: 'Okay', description: 'Okay' },
+        last_action: { timestamp: Math.floor(Date.now() / 1000) - 16 },
+        bazaar: BAZAAR_MAP
+      });
+    }
+    setTimeout(() => o.onload({ status: 200, responseText: body }), 0);
+  };
+
+  win.eval(SOURCE);
+  win.document.dispatchEvent(new win.Event('DOMContentLoaded', { bubbles: true }));
+  const doc = win.document;
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 1, 8000, 'the bazaar owner to be checked');
+
+  const row = resultRows(doc)[0];
+  assert.match(row.textContent, /donhordking/);
+  assert.doesNotMatch(row.textContent, /\$0 on sale/, 'not scored as empty');
+  // A page scan has no item to value, so their whole bazaar is shown as
+  // context and no profit is claimed from it.
+  assert.match(row.textContent, /bazaar \$3\.89m/, 'the stock is shown: ' + row.textContent);
+  assert.match(row.textContent, /no item selected/, 'and the profit says why not');
+  dom.window.close();
+});
+
+t('an item scan values only that item, not the rest of their stock', async () => {
+  // The bazaar in the report holds pangolin scales plus twelve other items.
+  // Picking the item must give the item's figure, not the bazaar total.
+  const BAZAAR = {
+    1: { ID: 1, name: 'Hydrogen Tank', quantity: 6, price: 25760, market_price: 23000 },
+    4: { ID: 4, name: 'Pangolin Scales', quantity: 18, price: 205000, market_price: 205000 },
+    5: { ID: 5, name: 'Single Red Rose', quantity: 1, price: 414, market_price: 400 }
+  };
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  win.GM_xmlhttpRequest = (() => {
+    const base = win.GM_xmlhttpRequest;
+    return function (opts) {
+      // The listing names the seller and the item.
+      if (/v2\/market\/4\/bazaar/.test(opts.url)) {
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify({
+                bazaar: [{ ID: 4425009, cost: 205000, quantity: 18, market_price: 205000 }]
+              })
+            }),
+          0
+        );
+        return;
+      }
+      if (/v2\/market\/4\/bazaar/.test(opts.url)) {
+        setTimeout(() => opts.onload({ status: 200, responseText: '{}' }), 0);
+        return;
+      }
+      if (/api\.torn\.com\/user\/4425009\?/.test(opts.url)) {
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify({
+                player_id: 4425009,
+                name: 'donhordking',
+                level: 17,
+                faction_id: 0,
+                status: { state: 'Okay', description: 'Okay' },
+                last_action: { timestamp: Math.floor(Date.now() / 1000) - 16 },
+                bazaar: BAZAAR
+              })
+            }),
+          0
+        );
+        return;
+      }
+      return base(opts);
+    };
+  })();
+
+  doc.querySelector('.tbms-tab[data-tab="scan"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  doc.getElementById('tbms-item-input').value = '4';
+  doc.getElementById('tbms-item-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+
+  await waitFor(() => resultRows(doc).length === 1, 9000, 'the seller to be checked');
+  const row = resultRows(doc)[0];
+
+  assert.match(row.textContent, /\$3\.69m on sale/, 'the item only: ' + row.textContent);
+  assert.doesNotMatch(
+    row.textContent,
+    /\$6\.08m/,
+    'not the whole bazaar (which would be 3.69m + 0.15m + 0.0004m)'
+  );
+  dom.window.close();
+});
+
+t('a bazaar Torn did not send says so instead of showing $0', async () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  // Refuse every request that asks for the bazaar, so the ladder narrows
+  // past it - exactly what produces an absent bazaar in the wild.
+  win.GM_xmlhttpRequest = (() => {
+    const base = win.GM_xmlhttpRequest;
+    return function (opts) {
+      if (/api\.torn\.com\/user\/\d+\?/.test(opts.url) && /bazaar/.test(opts.url)) {
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify({
+                error: { code: 4, error: 'Wrong fields' }
+              })
+            }),
+          0
+        );
+        return;
+      }
+      return base(opts);
+    };
+  })();
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
+
+  const alice = resultRows(doc)[0];
+  assert.match(
+    alice.textContent,
+    /value not read|Torn did not return their bazaar/i,
+    'the row explains: ' + alice.textContent
+  );
+  assert.doesNotMatch(alice.textContent, /\$0 on sale/, 'rather than claiming nothing');
+  dom.window.close();
+});
+
+t('switching tabs keeps the results and everything else on screen', async () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  // Something in each tab worth losing.
+  doc.getElementById('tbms-item-input').value = 'half typed item';
+  const interval = doc.getElementById('tbms-auto-interval');
+  interval.value = '45';
+  interval.dispatchEvent(new win.Event('change', { bubbles: true }));
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
+
+  const go = (tab) =>
+    doc.querySelector('.tbms-tab[data-tab="' + tab + '"]').dispatchEvent(
+      new win.MouseEvent('click', { bubbles: true })
+    );
+
+  go('filters');
+  go('watch');
+  go('setup');
+  go('results');
+  go('scan');
+  go('results');
+
+  assert.equal(resultRows(doc).length, 3, 'the results are still there');
+  assert.equal(
+    doc.getElementById('tbms-item-input').value,
+    'half typed item',
+    'the half-typed item survived too'
+  );
+  assert.equal(doc.getElementById('tbms-auto-interval').value, '45', 'and the interval');
+  dom.window.close();
+});
+
+t('the last scan comes back after the page reloads', async () => {
+  // A full page load is what a Torn tab change actually is, and it used to
+  // wipe the table.
+  const first = boot();
+  first.win.document
+    .getElementById('tbms-scan-btn')
+    .dispatchEvent(new first.win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(first.win.document).length === 3, 8000, 'the first scan');
+
+  // Let the queued write land before standing in for a reload.
+  await waitFor(
+    () => first.store.get('results_v1') || null,
+    3000,
+    'the results to be written to storage'
+  );
+  const persisted = first.store.get('results_v1');
+  first.dom.window.close();
+
+  // Fresh page, same storage.
+  const second = boot(SEED_SETTINGS, { results_v1: persisted });
+  const doc2 = second.win.document;
+  assert.equal(resultRows(doc2).length, 3, 'the results are back without scanning again');
+  assert.match(doc2.getElementById('tbms-foot').textContent, /restored 3/i, 'and it says so');
+  second.dom.window.close();
+});
+
+t('restored results are re-scored against the filters as they are now', async () => {
+  const first = boot();
+  first.win.document
+    .getElementById('tbms-scan-btn')
+    .dispatchEvent(new first.win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(first.win.document).length === 3, 8000, 'the first scan');
+  await waitFor(() => first.store.get('results_v1') || null, 3000, 'the write');
+  const persisted = first.store.get('results_v1');
+  first.dom.window.close();
+
+  // Come back with a filter that nothing can pass.
+  const strict = JSON.parse(JSON.stringify(SEED_SETTINGS));
+  strict.filters = { maxFairFight: { on: true, value: 1.0 } };
+  const second = boot(strict, { results_v1: persisted });
+  const doc2 = second.win.document;
+
+  assert.equal(resultRows(doc2).length, 3, 'still listed');
+  assert.equal(
+    Array.from(resultRows(doc2)).filter((tr) => tr.classList.contains('tbms-match')).length,
+    0,
+    'but nothing matches the stricter filter'
+  );
+  second.dom.window.close();
+});
+
+t('a stored result set that has gone stale is not restored', async () => {
+  const old = JSON.stringify({
+    at: Date.now() - 13 * 3600 * 1000, // past the 12h window
+    label: 'yesterday',
+    subjects: [{ id: 42, name: 'Ancient', value: 1, loot: 1 }]
+  });
+  const { dom, win } = boot(SEED_SETTINGS, { results_v1: old });
+  assert.equal(resultRows(win.document).length, 0, 'nothing came back');
+  dom.window.close();
+});
+
+t('a scan that finds matches raises a card carrying the actions', async () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  assert.equal(doc.getElementById('tbms-results-toast'), null, 'nothing before a scan');
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => doc.getElementById('tbms-results-toast'), 8000, 'the card to appear');
+
+  const card = doc.getElementById('tbms-results-toast');
+  // In this fixture only Alice survives every filter, so the card says one.
+  assert.match(card.textContent, /1 match/, 'it counts the matches');
+  assert.match(card.textContent, /Alice/, 'and names them');
+
+  // Every action for a result, without opening the panel.
+  const links = Array.from(card.querySelectorAll('a.tbms-toast-btn'));
+  const attack = links.find((a) => a.textContent === 'attack');
+  const bazaar = links.find((a) => a.textContent === 'bazaar');
+  assert.ok(attack, 'attack button present');
+  assert.ok(bazaar, 'bazaar button present');
+  assert.match(attack.getAttribute('href'), /user2ID=1111111/);
+
+  const watch = Array.from(card.querySelectorAll('button.tbms-toast-btn')).find(
+    (b) => b.textContent === 'watch'
+  );
+  assert.ok(watch, 'watch button present');
+  dom.window.close();
+});
+
+t('the card can be dismissed and does not spring back', async () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => doc.getElementById('tbms-results-toast'), 8000, 'the card');
+
+  doc.querySelector('#tbms-results-toast .tbms-toast-close').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  assert.equal(doc.getElementById('tbms-results-toast'), null, 'it is gone');
+
+  // Re-scoring the same results must not re-raise it.
+  doc.querySelector('.tbms-tab[data-tab="filters"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  const rescore = Array.from(doc.querySelectorAll('section[data-tab="filters"] button')).find((b) =>
+    /Re-score/.test(b.textContent)
+  );
+  rescore.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(doc.getElementById('tbms-results-toast'), null, 'still dismissed');
+  dom.window.close();
+});
+
+t('watch on the card adds the player without opening the panel', async () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => doc.getElementById('tbms-results-toast'), 8000, 'the card');
+
+  const watch = Array.from(
+    doc.querySelectorAll('#tbms-results-toast button.tbms-toast-btn')
+  ).find((b) => b.textContent === 'watch');
+  watch.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(
+    () => JSON.parse(win.localStorage.getItem('tbms_watch_v1') || 'null') ||
+          /added to the watchlist/.test(doc.getElementById('tbms-foot').textContent),
+    3000,
+    'the watchlist to be updated'
+  );
+  assert.match(doc.getElementById('tbms-foot').textContent, /added to the watchlist/i);
+  dom.window.close();
+});
+
+t('the card can be switched off entirely', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED_SETTINGS));
+  seed.ui.toast = false;
+  const { dom, win } = boot(seed);
+  const doc = win.document;
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
+  assert.equal(doc.getElementById('tbms-results-toast'), null, 'no card was raised');
+  dom.window.close();
+});
+
+t('the auto-scan interval is editable and reschedules the loop', async () => {
+  const { dom, win, store } = boot();
+  const doc = win.document;
+
+  const input = doc.getElementById('tbms-auto-interval');
+  assert.ok(input, 'the interval field exists');
+  // The seed does not set it, so the default is what should be shown.
+  assert.equal(input.value, '60', 'shows the current interval');
+
+  input.value = '45';
+  input.dispatchEvent(new win.Event('change', { bubbles: true }));
+  await waitFor(() => {
+    const s = JSON.parse(store.get('settings') || '{}');
+    return s.scan && s.scan.auto && s.scan.auto.intervalSec === 45;
+  }, 3000, 'the interval to be saved');
+
+  // Nonsense is clamped rather than accepted.
+  input.value = '1';
+  input.dispatchEvent(new win.Event('change', { bubbles: true }));
+  await waitFor(() => {
+    const s = JSON.parse(store.get('settings') || '{}');
+    return s.scan.auto.intervalSec >= 10;
+  }, 3000, 'the floor to apply');
+  assert.equal(input.value, '10', 'and the field shows what was applied');
+  dom.window.close();
+});
+
+t('players who will be free soon are watched automatically', async () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  // Give Bob a release time: he is in hospital with 4 minutes left, and the
+  // watch window is 30 minutes by default.
+  win.GM_xmlhttpRequest = (() => {
+    const base = win.GM_xmlhttpRequest;
+    return function (opts) {
+      if (/api\.torn\.com\/user\/2222222\?/.test(opts.url)) {
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify(
+                tornUser(2222222, {
+                  profile: {
+                    name: 'Bob',
+                    level: 45,
+                    last_action: NOW - 60,
+                    status: {
+                      state: 'Hospital',
+                      description: 'In hospital',
+                      until: NOW + 4 * 60
+                    }
+                  }
+                })
+              )
+            }),
+          0
+        );
+        return;
+      }
+      return base(opts);
+    };
+  })();
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
+
+  doc.querySelector('.tbms-tab[data-tab="watch"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  const watch = await waitFor(
+    () => (/Bob/.test(doc.querySelector('section[data-tab="watch"]').textContent)
+      ? doc.querySelector('section[data-tab="watch"]')
+      : null),
+    3000,
+    'the nearly-free player to be watched'
+  );
+  assert.match(watch.textContent, /1 watched/, 'with a count');
+  assert.match(watch.textContent, /Hospital|out in/i, 'and why they are on it');
+  dom.window.close();
+});
+
+t('a watched player is flagged the moment they are back', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED_SETTINGS));
+  const { dom, win } = boot(seed);
+  const doc = win.document;
+
+  // Bob starts in hospital with four minutes to go, so a scan watches him.
+  let bobReleased = false;
+  win.GM_xmlhttpRequest = (() => {
+    const base = win.GM_xmlhttpRequest;
+    return function (opts) {
+      if (/api\.torn\.com\/user\/2222222\?/.test(opts.url)) {
+        const profile = bobReleased
+          ? {
+              name: 'Bob',
+              level: 45,
+              last_action: NOW - 10,
+              status: { state: 'Okay', description: 'Okay' }
+            }
+          : {
+              name: 'Bob',
+              level: 45,
+              last_action: NOW - 60,
+              status: { state: 'Hospital', description: 'In hospital', until: NOW + 4 * 60 }
+            };
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify(
+                tornUser(2222222, {
+                  profile: profile,
+                  bazaar: [{ name: 'Xanax', quantity: 40, price: 800000, market_price: 900000 }]
+                })
+              )
+            }),
+          0
+        );
+        return;
+      }
+      return base(opts);
+    };
+  })();
+
+  doc.querySelector('.tbms-tab[data-tab="scan"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
+
+  doc.querySelector('.tbms-tab[data-tab="watch"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  await waitFor(
+    () => (/Bob/.test(doc.querySelector('section[data-tab="watch"]').textContent) ? true : null),
+    3000,
+    'Bob to be watched'
+  );
+
+  // He is discharged.
+  bobReleased = true;
+  const checkBtn = Array.from(doc.querySelectorAll('section[data-tab="watch"] button')).find(
+    (b) => b.textContent === 'Check now'
+  );
+  checkBtn.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+
+  await waitFor(
+    () => /back now/.test(doc.querySelector('section[data-tab="watch"]').textContent),
+    6000,
+    'Bob to be flagged as back'
+  );
+
+  const watch = doc.querySelector('section[data-tab="watch"]');
+  const attack = Array.from(watch.querySelectorAll('a')).find((a) => a.textContent === 'attack');
+  assert.ok(attack, 'an attack link appears once they are reachable');
+  assert.match(attack.getAttribute('href'), /user2ID=2222222/);
+  assert.match(doc.getElementById('tbms-foot').textContent, /ready to attack/i, 'and it is announced');
+  dom.window.close();
+});
+
+t('the watchlist survives a page reload', async () => {
+  // The list must already be in storage when the script starts, which is
+  // exactly what happens after a refresh.
+  const seeded = {
+    watch_v1: JSON.stringify({
+      555: {
+        id: 555,
+        name: 'Old Target',
+        state: 'Abroad',
+        until: Math.floor(Date.now() / 1000) + 900,
+        ready: false,
+        checkedAt: Date.now()
+      }
+    })
+  };
+  const { dom, win } = boot(SEED_SETTINGS, seeded);
+  const doc = win.document;
+
+  doc.querySelector('.tbms-tab[data-tab="watch"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  const watch = doc.querySelector('section[data-tab="watch"]');
+  assert.match(watch.textContent, /Old Target/, 'the saved player is back on the list');
+  assert.match(watch.textContent, /1 watched/, 'and counted');
+  dom.window.close();
+});
+
+t('the watch tab is labelled with how many are back', () => {
+  const seeded = {
+    watch_v1: JSON.stringify({
+      777: {
+        id: 777,
+        name: 'Returned Rita',
+        state: 'Okay',
+        ready: true,
+        readyAt: Date.now(),
+        checkedAt: Date.now()
+      }
+    })
+  };
+  const { dom, win } = boot(SEED_SETTINGS, seeded);
+  const doc = win.document;
+
+  const tab = doc.querySelector('.tbms-tab[data-tab="watch"]');
+  assert.match(tab.textContent, /Watch · 1/, 'the tab advertises the returned player');
+  assert.ok(tab.classList.contains('tbms-tab-alert'), 'and is highlighted');
+
+  doc.querySelector('.tbms-tab[data-tab="watch"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  const watch = doc.querySelector('section[data-tab="watch"]');
+  assert.match(watch.textContent, /back now/, 'shown as ready');
+  assert.ok(
+    Array.from(watch.querySelectorAll('a')).some((a) => a.textContent === 'attack'),
+    'with an attack link'
+  );
+  dom.window.close();
+});
+
+/* ------------------------------------------------------------------ */
+/* API economy: the free sources go first                              */
+/* ------------------------------------------------------------------ */
+
+t('sellers from every source are merged, not just the first that answers', async () => {
+  // Torn's own listing is short; the scanner knows of more. Stopping at the
+  // first source that responded meant a common item could exhaust itself
+  // after ten sellers, because the fuller list was never consulted.
+  const { dom, win, calls } = boot();
+  const doc = win.document;
+
+  const TORN_ROWS = [1111111, 2222222].map((id) => ({
+    ID: id,
+    cost: 800000,
+    quantity: 10,
+    market_price: 850000
+  }));
+  const SCANNER_ROWS = [3333333, 4444444, 5555555, 6666666].map((id) => ({
+    player_id: id,
+    player_name: 'Scan' + id,
+    price: 810000,
+    quantity: 12,
+    last_checked: NOW
+  }));
+
+  win.GM_xmlhttpRequest = (() => {
+    const base = win.GM_xmlhttpRequest;
+    return function (opts) {
+      if (/v2\/market\/206\/bazaar/.test(opts.url)) {
+        setTimeout(
+          () => opts.onload({ status: 200, responseText: JSON.stringify({ bazaar: TORN_ROWS }) }),
+          0
+        );
+        return;
+      }
+      if (/weav3r\.dev\/api\/marketplace\/206/.test(opts.url)) {
+        calls.push(opts.url); // intercepted, so record it here
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify({ item_id: 206, market_price: 850000, listings: SCANNER_ROWS })
+            }),
+          0
+        );
+        return;
+      }
+      // Give the scanner's sellers a profile so their rows can render.
+      const m = opts.url.match(/api\.torn\.com\/user\/(\d+)\?/);
+      if (m && ['3333333', '4444444', '5555555', '6666666'].includes(m[1])) {
+        calls.push(opts.url);
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify(
+                tornUser(Number(m[1]), {
+                  profile: {
+                    name: 'Scan' + m[1],
+                    level: 30,
+                    last_action: NOW - 60,
+                    status: { state: 'Okay', description: 'Okay' }
+                  }
+                })
+              )
+            }),
+          0
+        );
+        return;
+      }
+      return base(opts);
+    };
+  })();
+
+  await waitFor(() => doc.getElementById('tbms-item-input'), 3000, 'the picker');
+  doc.getElementById('tbms-item-input').value = '206';
+  doc.getElementById('tbms-item-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length >= 6, 12000, 'sellers from both sources');
+
+  // The scanner was consulted even though Torn answered first.
+  assert.ok(
+    calls.some((u) => /weav3r\.dev\/api\/marketplace\/206/.test(u)),
+    'the fuller source was asked'
+  );
+  const names = Array.from(resultRows(doc)).map((tr) => tr.textContent);
+  assert.ok(
+    names.some((n) => /Scan3333333|Scan4444444|Scan5555555|Scan6666666/.test(n)),
+    'and its sellers are in the list'
+  );
+  dom.window.close();
+});
+
+t('a page scan on an item page still prices what it finds', async () => {
+  // Skeed sells through the item market, so his bazaar lookup finds
+  // nothing. With the item known from the page, his listing prices him.
+  const page =
+    '<!doctype html><html><body>' +
+    '<div id="notes_panel_button" class="icon-wrap"><svg></svg></div>' +
+    '<a href="/profiles.php?XID=2175816">Skeed</a>' +
+    '</body></html>';
+  const dom = new JSDOM(page, {
+    url: 'https://www.torn.com/page.php?sid=ItemMarket#/market/view=search&itemID=206',
+    runScripts: 'outside-only',
+    pretendToBeVisual: true
+  });
+  const win = dom.window;
+  const store = new Map([['settings', JSON.stringify(SEED_SETTINGS)]]);
+  win.GM_getValue = (k, d) => (store.has(k) ? store.get(k) : d);
+  win.GM_setValue = (k, v) => store.set(k, v);
+  win.GM_addStyle = () => {};
+  win.GM_registerMenuCommand = () => {};
+  win.GM_xmlhttpRequest = function (o) {
+    let body = '{}';
+    if (/get-stats/.test(o.url)) {
+      body = JSON.stringify([
+        { player_id: 2175816, fair_fight: 1.73, bs_estimate: 128900, source: 'bss' }
+      ]);
+    } else if (/selections=items/.test(o.url)) {
+      body = JSON.stringify({ items: { 206: { name: 'Xanax' } } });
+    } else if (/v2\/market\/206\/bazaar/.test(o.url)) {
+      body = JSON.stringify({ bazaar: [{ ID: 2175816, cost: 800000, quantity: 40, market_price: 850000 }] });
+    } else if (/api\.torn\.com\/user\/2175816\?/.test(o.url)) {
+      body = JSON.stringify({
+        player_id: 2175816,
+        name: 'Skeed',
+        level: 26,
+        faction_id: 0,
+        status: { state: 'Okay', description: 'Okay' },
+        last_action: { timestamp: Math.floor(Date.now() / 1000) - 400 },
+        // Selling on the item market, so their bazaar is empty.
+        bazaar: []
+      });
+    }
+    setTimeout(() => o.onload({ status: 200, responseText: body }), 0);
+  };
+
+  win.eval(SOURCE);
+  win.document.dispatchEvent(new win.Event('DOMContentLoaded', { bubbles: true }));
+  const doc = win.document;
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 1, 9000, 'the page seller to be checked');
+
+  const row = resultRows(doc)[0];
+  assert.match(row.textContent, /Skeed/);
+  assert.doesNotMatch(row.textContent, /value not read/, 'he is priced: ' + row.textContent);
+  assert.doesNotMatch(row.textContent, /no item selected/, 'the page supplied the item');
+  assert.match(row.textContent, /\$32\.00m on sale/, '40 x 800,000');
+  dom.window.close();
+});
+
+/* ------------------------------------------------------------------ */
+/* Repeat scans must surface new names, not the same ones              */
+/* ------------------------------------------------------------------ */
+
+t('a seller listing the item is a hit even when their bazaar is empty', async () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  // Someone selling 30 of the item at the going rate, whose bazaar lookup
+  // comes back with nothing - the reported "should have been a hit" case.
+  win.GM_xmlhttpRequest = (() => {
+    const base = win.GM_xmlhttpRequest;
+    return function (opts) {
+      if (/v2\/market\/206\/bazaar/.test(opts.url)) {
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify({
+                bazaar: [{ ID: 1111111, cost: 40000, quantity: 30, market_price: 40000 }]
+              })
+            }),
+          0
+        );
+        return;
+      }
+      if (/api\.torn\.com\/user\/1111111\?/.test(opts.url)) {
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify({
+                player_id: 1111111,
+                name: 'starbug',
+                level: 20,
+                faction_id: 0,
+                status: { state: 'Okay', description: 'Okay' },
+                last_action: { timestamp: Math.floor(Date.now() / 1000) - 120 },
+                // Their bazaar is empty, as Torn often reports for someone
+                // selling through the item market.
+                bazaar: []
+              })
+            }),
+          0
+        );
+        return;
+      }
+      return base(opts);
+    };
+  })();
+
+  doc.querySelector('.tbms-tab[data-tab="scan"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  doc.getElementById('tbms-item-input').value = '206';
+  doc.getElementById('tbms-item-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+
+  await waitFor(() => resultRows(doc).length === 1, 9000, 'the seller to be checked');
+  const row = resultRows(doc)[0];
+
+  assert.match(row.textContent, /starbug/, 'the seller is listed');
+  assert.match(row.textContent, /1\.20m on sale/, 'valued from the listing, not the bazaar');
+  assert.doesNotMatch(row.textContent, /\$0 on sale/, 'and not scored as empty');
+  assert.ok(row.classList.contains('tbms-match'), 'so it is a hit');
+  dom.window.close();
+});
+
+t('repeating an item scan accumulates new names instead of repeating', async () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  // The bazaar gains a seller between passes.
+  let sellers = [{ ID: 1111111, cost: 800000, quantity: 30 }];
+  win.GM_xmlhttpRequest = (() => {
+    const base = win.GM_xmlhttpRequest;
+    return function (opts) {
+      if (/v2\/market\/206\/bazaar/.test(opts.url)) {
+        setTimeout(
+          () => opts.onload({ status: 200, responseText: JSON.stringify({ bazaar: sellers }) }),
+          0
+        );
+        return;
+      }
+      // The newly listed seller, who the shared stub does not know about.
+      if (/api\.torn\.com\/user\/4444444\?/.test(opts.url)) {
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify(
+                tornUser(4444444, {
+                  profile: {
+                    name: 'Newcomer',
+                    level: 30,
+                    last_action: NOW - 30,
+                    status: { state: 'Okay', description: 'Okay' }
+                  }
+                })
+              )
+            }),
+          0
+        );
+        return;
+      }
+      return base(opts);
+    };
+  })();
+
+  doc.querySelector('.tbms-tab[data-tab="scan"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  doc.getElementById('tbms-item-input').value = '206';
+  doc.getElementById('tbms-item-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 1, 8000, 'the first auto pass');
+  assert.match(resultRows(doc)[0].textContent, /Alice/, 'with the first seller');
+
+  // A new seller appears, and starting auto-scan runs a pass immediately.
+  sellers = [
+    { ID: 1111111, cost: 800000, quantity: 30 },
+    { ID: 4444444, cost: 810000, quantity: 12 }
+  ];
+
+  const autoBtn = doc.getElementById('tbms-auto-btn');
+  autoBtn.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+
+  // Alice is already known, so only the newly listed seller is added - and
+  // the table grows to hold both rather than repeating Alice alone.
+  await waitFor(() => resultRows(doc).length === 2, 9000, 'the new seller to appear');
+
+  const names = Array.from(resultRows(doc)).map((tr) => tr.textContent.slice(0, 24));
+  assert.equal(new Set(names).size, 2, 'two distinct rows, no repeat of Alice');
+  assert.ok(
+    names.some((n) => /Newcomer/.test(n)),
+    'the newly listed seller is the one that was added: ' + JSON.stringify(names)
+  );
+  dom.window.close();
+});
+
+t('Torn is only asked about players the free sources could not rule out', async () => {
+  const { dom, win, calls } = boot();
+  const doc = win.document;
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
+
+  const ffCalls = calls.filter((u) => u.includes('ffscouter'));
+  const tornCalls = calls.filter((u) => /api\.torn\.com\/user\/\d+\?/.test(u));
+
+  // Three sellers: FFScouter judges all three in one batched request and
+  // Carol (FF 9.4) is dropped, so Torn is asked about two.
+  assert.equal(ffCalls.length, 1, 'one batched call covers every candidate');
+  assert.equal(tornCalls.length, 2, 'only the survivors cost a Torn request');
+  assert.ok(
+    tornCalls.length < 3,
+    'the precious per-player source is used less than the free one'
+  );
+});
+
+t('a screened-out player is shown as unchecked, not as having nothing', async () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
+
+  const carol = Array.from(resultRows(doc)).find((tr) => /Carol/.test(tr.textContent));
+  assert.match(carol.textContent, /not checked/i, 'their unread columns say so');
+  assert.doesNotMatch(
+    carol.textContent,
+    /\$0 bazaar/,
+    'never claims an empty bazaar they were never checked for'
+  );
+  assert.match(carol.textContent, /screened out: fair fight/i, 'with the screen reason');
+  dom.window.close();
+});
+
+t('key fields are not password inputs, so nothing offers to save them', () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  // A single type="password" anywhere is enough for Chrome to offer to
+  // save a login and for managers to start autofilling.
+  assert.equal(
+    doc.querySelectorAll('input[type="password"]').length,
+    0,
+    'no password-typed inputs anywhere in the UI'
+  );
+
+  const key = doc.getElementById('tbms-torn-key');
+  assert.ok(key, 'the Torn key field exists');
+  assert.equal(key.getAttribute('type'), 'text', 'it is a plain text field');
+  assert.equal(key.getAttribute('autocomplete'), 'off');
+  assert.equal(key.getAttribute('spellcheck'), 'false');
+  assert.equal(key.getAttribute('autocapitalize'), 'off');
+  assert.equal(key.getAttribute('autocorrect'), 'off');
+
+  // The opt-outs the major managers actually honour.
+  assert.equal(key.getAttribute('data-lpignore'), 'true', 'LastPass opts out');
+  assert.equal(key.getAttribute('data-1p-ignore'), 'true', '1Password opts out');
+  assert.equal(key.getAttribute('data-bwignore'), 'true', 'Bitwarden opts out');
+  assert.equal(key.getAttribute('data-form-type'), 'other', 'Dashlane opts out');
+
+  // Masked visually, which is why it does not need to be a password field.
+  assert.ok(key.classList.contains('tbms-masked'), 'it is CSS-masked');
+
+  // And it is not inside a form, so there is no login to submit.
+  assert.equal(key.closest('form'), null, 'no form wrapper');
+  dom.window.close();
+});
+
+t('the key can be revealed without becoming a password field', () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+  const key = doc.getElementById('tbms-torn-key');
+  const row = key.parentNode;
+  const toggle = row.querySelector('button');
+
+  assert.equal(toggle.textContent, 'Show', 'offers to reveal while masked');
+  toggle.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  assert.ok(!key.classList.contains('tbms-masked'), 'no longer masked');
+  assert.equal(key.getAttribute('type'), 'text', 'still not a password field');
+  assert.equal(toggle.textContent, 'Hide', 'offers to hide again');
+
+  toggle.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  assert.ok(key.classList.contains('tbms-masked'), 'masked again');
+  dom.window.close();
+});
+
+t('the optional FFScouter key field follows the same rules', () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+  const ff = doc.getElementById('tbms-ff-key');
+  assert.ok(ff, 'the FFScouter key field exists');
+  assert.equal(ff.getAttribute('type'), 'text');
+  assert.equal(ff.getAttribute('data-lpignore'), 'true');
+  assert.equal(ff.getAttribute('data-1p-ignore'), 'true');
+  assert.ok(ff.classList.contains('tbms-masked'));
+  dom.window.close();
+});
+
+/* ------------------------------------------------------------------ */
 /* Auto-scan (continuous, with a state that survives a refresh)        */
 /* ------------------------------------------------------------------ */
 
@@ -1012,7 +2179,7 @@ t('a running auto-scan resumes by itself after a refresh', async () => {
 
   const rows = await waitFor(
     () => {
-      const r = doc.querySelectorAll('table.tbms-table tbody tr');
+      const r = resultRows(doc);
       return r.length ? r : null;
     },
     10000,
@@ -1020,7 +2187,7 @@ t('a running auto-scan resumes by itself after a refresh', async () => {
   );
   assert.ok(rows.length >= 1, 'it scanned without anyone pressing anything');
   assert.ok(
-    calls.some((u) => /market\/206\?selections=bazaar/.test(u)),
+    calls.some((u) => /v2\/market\/206\/bazaar/.test(u)),
     'it watched the saved item'
   );
   dom.window.close();
@@ -1033,9 +2200,9 @@ t('a paused auto-scan stays paused after a refresh', async () => {
   const doc = win.document;
 
   await new Promise((r) => setTimeout(r, 1200));
-  assert.equal(doc.querySelectorAll('table.tbms-table tbody tr').length, 0, 'nothing was scanned');
+  assert.equal(resultRows(doc).length, 0, 'nothing was scanned');
   assert.ok(
-    !calls.some((u) => /market\/206\?selections=bazaar/.test(u)),
+    !calls.some((u) => /v2\/market\/206\/bazaar/.test(u)),
     'it did not touch the bazaar for a paused scan'
   );
   dom.window.close();
@@ -1074,7 +2241,7 @@ t('a seller whose data is private still appears, by name', async () => {
 
   const rows = await waitFor(
     () => {
-      const r = doc.querySelectorAll('table.tbms-table tbody tr');
+      const r = resultRows(doc);
       return r.length === 3 ? r : null;
     },
     9000,
@@ -1096,10 +2263,10 @@ t('re-filtering sorts matches first exactly like a scan does', async () => {
   const doc = win.document;
 
   doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
-  await waitFor(() => doc.querySelectorAll('table.tbms-table tbody tr').length === 3, 8000, 'scan');
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
 
   // The scan puts the single match on top.
-  let first = doc.querySelector('table.tbms-table tbody tr');
+  let first = resultRows(doc)[0];
   assert.ok(first.classList.contains('tbms-match'), 'scan sorted the match first');
 
   // Re-score with everything relaxed: now all three are matches.
@@ -1118,11 +2285,11 @@ t('re-filtering sorts matches first exactly like a scan does', async () => {
   rescore.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
 
   await waitFor(
-    () => doc.querySelectorAll('table.tbms-table tbody tr.tbms-match').length === 3,
+    () => Array.from(resultRows(doc)).filter((tr) => tr.classList.contains('tbms-match')).length === 2,
     3000,
-    'all three to become matches'
+    'the checked sellers to become matches'
   );
-  first = doc.querySelector('table.tbms-table tbody tr');
+  first = resultRows(doc)[0];
   assert.ok(first.classList.contains('tbms-match'), 'and the ordering rule held');
   dom.window.close();
 });
@@ -1157,7 +2324,7 @@ t('waits out a Torn rate limit and then resumes by itself', async () => {
   // All three sellers must still land, including the one that got limited.
   const rows = await waitFor(
     () => {
-      const r = doc.querySelectorAll('table.tbms-table tbody tr');
+      const r = resultRows(doc);
       return r.length === 3 ? r : null;
     },
     10000,
