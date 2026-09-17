@@ -2163,7 +2163,7 @@
     "--tb-text:#e3ebf2;--tb-text-dim:#94a3b0;--tb-text-faint:#63727e;",
     "--tb-ok:#4ade80;--tb-warn:#fbbf24;--tb-bad:#f87171;--tb-r:9px;}",
     "#tbms-root{position:fixed;inset:0;pointer-events:none;z-index:2147483000;",
-    "Segoe UI",
+    "font-family:ui-sans-serif,system-ui,-apple-system,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;",
     "font-size:13px;line-height:1.45;-webkit-font-smoothing:antialiased;color:var(--tb-text);}",
     "#tbms-root *{box-sizing:border-box;}",
     "#tbms-root ::-webkit-scrollbar{width:9px;height:9px;}",
@@ -2225,7 +2225,7 @@
     ".tbms-tab.tbms-active{background:var(--tb-bg);color:var(--tb-accent);border-color:var(--tb-line);",
     "font-weight:600;}",
     ".tbms-tab.tbms-tab-alert{color:var(--tb-ok);}",
-    "",
+    ".tbms-tab.tbms-tab-alert:after{content:\"\";display:inline-block;width:6px;height:6px;",
     "border-radius:50%;background:var(--tb-ok);margin-left:6px;vertical-align:middle;",
     "box-shadow:0 0 6px rgba(74,222,128,.8);}",
     "#tbms-body{overflow:auto;padding:14px;flex:1 1 auto;min-height:0;}",
@@ -2258,7 +2258,7 @@
     ".tbms-switch input{opacity:0;width:0;height:0;position:absolute;}",
     ".tbms-slider{position:absolute;inset:0;background:#2a3640;border-radius:10px;",
     "transition:background .16s ease;cursor:pointer;}",
-    "",
+    ".tbms-slider:before{content:\"\";position:absolute;width:14px;height:14px;left:3px;top:3px;",
     "background:#8496a4;border-radius:50%;transition:transform .16s ease,background .16s ease;",
     "box-shadow:0 1px 2px rgba(0,0,0,.4);}",
     ".tbms-switch input:checked+.tbms-slider{background:var(--tb-accent-dim);}",
@@ -2269,7 +2269,7 @@
     "font-weight:600;list-style:none;outline:none;}",
     "details.tbms-adv>summary::-webkit-details-marker{display:none;}",
     "details.tbms-adv>summary:hover{color:var(--tb-text);}",
-    "\\25B8",
+    "details.tbms-adv>summary:before{content:\"\\25B8\";display:inline-block;width:14px;",
     "color:var(--tb-text-faint);transition:transform .15s ease;}",
     "details.tbms-adv[open]>summary:before{transform:rotate(90deg);}",
     "details.tbms-adv[open]{padding-bottom:10px;}",
@@ -2351,7 +2351,6 @@
     ".tbms-toast-more{flex:1 1 auto;color:var(--tb-text-faint);font-size:10.5px;}",
     ".tbms-tip{margin-top:8px;padding:7px 9px;border-radius:7px;font-size:11.5px;",
     "color:#e8d9a0;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.28);}",
-    ""
   ].join("");
   function injectStyle() {
     if (typeof GM_addStyle === "function") {
