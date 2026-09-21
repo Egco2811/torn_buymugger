@@ -180,45 +180,47 @@ test('a seller with no usable price is not valued at zero', () => {
 /* The mugging formula                                                 */
 /* ------------------------------------------------------------------ */
 
-test('the mug percentage is (1 + merits/10) x (23 - ln cash)', () => {
-  // Hand-computed: ln(1e6) = 13.8155, so 23 - 13.8155 = 9.1845 -> 9.18%.
-  assert.equal(s.mugPercent(1000000, 0), 9.18);
-  // ln(5e6) = 15.4249 -> 7.5751 -> 7.58%.
-  assert.equal(s.mugPercent(5000000, 0), 7.58);
-  // Merits scale the rate: 10 points doubles it.
-  assert.equal(s.mugPercent(1000000, 10), 18.37);
-  assert.equal(s.mugPercent(5000000, 10), 15.15);
+test('a mug takes a flat 5% to 10% of the wallet, rolled at random', () => {
+  // Torn's patch #115 dropped the old log curve for a flat band, and the
+  // roll is weighted towards the low end.
+  const b = s.mugBand(1000000, {});
+  assert.equal(b.lowPct, 5);
+  assert.equal(b.likelyPct, 6.5);
+  assert.equal(b.highPct, 10);
+  assert.equal(b.low, 50000, '5% of 1m');
+  assert.equal(b.likely, 65000, 'the low-favoured roll');
+  assert.equal(b.high, 100000, '10% of 1m');
+  assert.equal(s.mugPercent(1000000, {}), 6.5, 'the headline rate is the likely roll');
+  assert.equal(s.mugTake(1000000, {}), 65000);
 });
 
-test('the rate bottoms out at 1% exactly at the formula cap', () => {
-  // The cap in the formula is e^22, and that is precisely where
-  // 23 - ln(cash) reaches 1 - so the two branches meet with no step.
-  assert.equal(s.MUG_CASH_CAP, Math.round(Math.exp(22)));
-  assert.equal(s.mugPercent(s.MUG_CASH_CAP - 1, 0), 1);
-  assert.equal(s.mugPercent(s.MUG_CASH_CAP, 0), 1);
-  assert.equal(s.mugPercent(1e10, 0), 1, 'richer targets still give 1%');
-  assert.equal(s.mugPercent(1e10, 10), 2, 'doubled by merits');
+test('the band is a rate, so it does not shrink on a richer target', () => {
+  // The old formula paid ~1% on a billionaire; the game still pays 5-10%.
+  assert.equal(s.mugPercent(1000000000, {}), 6.5);
+  assert.equal(s.mugPercent(100, {}), 6.5);
+  assert.equal(s.mugTake(1000000000, {}), 65000000);
+});
+
+test('Masterful Looting adds 5% a point and Plunder stacks on top', () => {
+  assert.equal(s.mugMultiplier({ mugMerits: 10 }), 1.5);
+  assert.equal(s.mugPercent(1000000, { mugMerits: 10 }), 9.75, '6.5 x 1.5');
+  assert.equal(s.mugBand(1000000, { mugMerits: 10 }).highPct, 15, 'the band at 10/10');
+  // The wiki's worst case: 10/10 merits plus a 49% Plunder weapon.
+  assert.equal(s.mugMultiplier({ mugMerits: 10, mugPlunder: 49 }), 1.99);
+  assert.equal(s.mugBand(1000000, { mugMerits: 10, mugPlunder: 49 }).highPct, 19.9);
+  assert.equal(s.mugMultiplier({ mugMerits: 99, mugPlunder: -5 }), 1.5, 'both inputs clamp');
 });
 
 test('the payout is floored, not rounded', () => {
-  // FLOOR(9.18 x 1,000,000 / 100) = 91,800
-  assert.equal(s.mugTake(1000000, 0), 91800);
-  // FLOOR(7.58 x 5,000,000 / 100) = 379,000
-  assert.equal(s.mugTake(5000000, 0), 379000);
-  // FLOOR(1 x 3,584,912,846 / 100) = 35,849,128 (the .46 is dropped)
-  assert.equal(s.mugTake(s.MUG_CASH_CAP, 0), 35849128);
+  // FLOOR(6.5 x 1,000,001 / 100) = 65,000 (the .065 is dropped)
+  assert.equal(s.mugTake(1000001, {}), 65000);
+  assert.equal(s.mugTake(1000000, {}), 65000);
 });
 
 test('mugging nothing pays nothing', () => {
-  assert.equal(s.mugTake(0, 0), 0);
-  assert.equal(s.mugTake(null, 0), 0);
-  assert.equal(s.mugPercent(0, 0), 0 || s.mugPercent(0, 0)); // no throw either way
-});
-
-test('the rate falls as the target holds more', () => {
-  const small = s.mugPercent(100000, 0);
-  const big = s.mugPercent(1000000000, 0);
-  assert.ok(small > big, `${small}% on 100k should beat ${big}% on 1b`);
+  assert.equal(s.mugTake(0, {}), 0);
+  assert.equal(s.mugTake(null, {}), 0);
+  assert.equal(s.mugBand(0, {}).likely, 0);
 });
 
 test('an overpriced listing shows up as a negative net profit', () => {
@@ -233,17 +235,19 @@ test('an overpriced listing shows up as a negative net profit', () => {
 
   const market = at(4000000);
   assert.equal(market.spend, 4000000, 'you hand over the asking price');
-  assert.equal(market.gross, 312000, 'mug pays 7.80% of it');
+  assert.equal(market.gross, 260000, 'the mug pays its likely 6.5%');
+  assert.equal(market.grossLow, 200000, '5% if the roll comes in low');
+  assert.equal(market.grossHigh, 400000, '10% if it comes in high');
   assert.equal(market.unitDifference, 0, 'no difference per item at market');
   assert.equal(market.totalDifference, 0);
-  assert.equal(market.net, 312000, 'so the mug is the whole profit');
+  assert.equal(market.net, 260000, 'so the mug is the whole profit');
 
   const over = at(5000000);
   assert.equal(over.unitDifference, -1000000, 'the difference per item is the overpay');
   assert.equal(over.totalDifference, -1000000);
-  assert.equal(over.gross, 379000, 'a bigger spend does pay out more');
+  assert.equal(over.gross, 325000, 'a bigger spend does pay out more');
   assert.ok(over.net < 0, 'but the net is a loss: ' + over.net);
-  assert.equal(over.net, -1000000 + 379000, 'the difference plus the mug');
+  assert.equal(over.net, -1000000 + 325000, 'the difference plus the mug');
   assert.ok(over.net < market.net, 'and it is worse than buying at market');
 });
 
@@ -331,11 +335,12 @@ test('the estimate spends the listing price', () => {
   const est = s.estimateEconomics(subject, { mugMerits: 0, factionCut: 0, liquidation: 1 });
 
   assert.equal(est.spend, 1000000, 'the asking price times the quantity');
-  // 23 - ln(1e6) = 9.18%, floored.
-  assert.equal(est.mugTake, 91800);
+  // 6.5% of 1m, floored.
+  assert.equal(est.mugPercent, 6.5);
+  assert.equal(est.mugTake, 65000);
   assert.equal(est.unitDifference, 20000, '20k under market per item');
   assert.equal(est.totalDifference, 200000);
-  assert.equal(est.net, 200000 + 91800, 'the difference plus the mug');
+  assert.equal(est.net, 200000 + 65000, 'the difference plus the mug');
 });
 
 test('reads an array of listings keyed by ID (the documented v1 shape)', () => {
@@ -444,10 +449,10 @@ test('the estimate follows the mug-and-keep-the-goods model', () => {
 
   const est = s.estimateEconomics(subject, econ);
   assert.equal(est.spend, 1000000);
-  // The game's formula: 23 - ln(1e6) = 9.18%, floored.
-  assert.equal(est.mugPercent, 9.18);
-  assert.equal(est.mugTake, 91800);
-  assert.equal(est.net, 91800, 'mug 91.8k, hand back the same 1m in goods');
+  // The game's band: 5-10% of what you hand over, the roll favouring 5%.
+  assert.equal(est.mugPercent, 6.5);
+  assert.equal(est.mugTake, 65000);
+  assert.equal(est.net, 65000, 'mug 65k, hand back the same 1m in goods');
 });
 
 test('the faction cut reduces the take', () => {
@@ -497,14 +502,14 @@ test('paying above market turns a profit into a loss', () => {
   const at = (price) => s.estimateEconomics(listingSubject(price, 4000000, 1), ECON);
 
   const market = at(4000000);
-  assert.equal(market.mugPercent, 7.8);
+  assert.equal(market.mugPercent, 6.5);
   assert.equal(market.unitDifference, 0, 'nothing gained or lost at market');
-  assert.equal(market.net, 312000, 'so the mug is the whole profit');
+  assert.equal(market.net, 260000, 'so the mug is the whole profit');
 
   const over = at(5000000);
-  assert.equal(over.mugPercent, 7.58);
+  assert.equal(over.mugPercent, 6.5);
   assert.equal(over.unitDifference, -1000000, 'the overpay is a per-item loss');
-  assert.equal(over.net, -621000, 'overpaying is a clear loss');
+  assert.equal(over.net, -675000, 'overpaying is a clear loss');
 });
 
 test('the loss grows with the overpay', () => {
@@ -522,9 +527,9 @@ test('mugging merits scale the take but cannot rescue an overpay', () => {
       liquidation: 1
     });
 
-  // Merits roughly double the take at 10 points.
-  assert.equal(at(4000000, 0).mugTake, 312000);
-  assert.equal(at(4000000, 10).mugTake, 624000);
+  // Merits scale half the take again at 10 points.
+  assert.equal(at(4000000, 0).mugTake, 260000);
+  assert.equal(at(4000000, 10).mugTake, 390000);
 
   // Even fully merited, overpaying by 25% still loses money here.
   assert.ok(at(5000000, 10).net < 0, 'a maxed merit does not make a bad price good');
@@ -572,7 +577,7 @@ test('only the searched item is valued, not the whole bazaar', () => {
   // And the loot follows the same figure.
   const d = s.lootBreakdown(subject);
   assert.equal(d.spend, 3690000);
-  assert.equal(d.net, s.mugTake(3690000, 0), 'at market, the mug is the profit');
+  assert.equal(d.net, s.mugTake(3690000, ECON), 'at market, the mug is the profit');
 });
 
 test('a different item in the same bazaar gives a different figure', () => {
@@ -728,9 +733,11 @@ test('the estimate spends the listing price, not a whole-bazaar basket', () => {
   // The mug is computed on what you hand over, since their own cash is
   // never visible - note the ignored money field above.
   assert.equal(est.mugTargetCash, 1200000);
-  // 23 - ln(1,200,000) = 9.0022 -> 9.00%, floored to 108,000.
-  assert.equal(est.mugPercent, 9);
-  assert.equal(est.mugGross, 108000);
+  // 6.5% of 1,200,000 = 78,000, with the band either side of it.
+  assert.equal(est.mugPercent, 6.5);
+  assert.equal(est.mugGross, 78000);
+  assert.equal(est.mugGrossLow, 60000);
+  assert.equal(est.mugGrossHigh, 120000);
 });
 
 function makeSubject(overrides = {}) {

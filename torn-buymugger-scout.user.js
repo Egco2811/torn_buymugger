@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Buy-Mug Scout
 // @namespace    torn-buymugger-scout
-// @version      1.0.3
+// @version      1.0.4
 // @description  Flags buy-muggable bazaar sellers using FFScouter battle-stat estimates, with toggleable filters, a watchlist for players who are nearly back, and an in-page UI. If you enjoy it, send a Xanax to Egco [2598210].
 // @author       Egco [2598210]
 // @license      AGPL-3.0-or-later
@@ -42,7 +42,7 @@
 // service, must release their source under the same terms.
 (function() {
   "use strict";
-  const VERSION = "1.0.0";
+  const VERSION = "1.0.4";
   const STORE_PREFIX = "tbms_";
   const TORN_BASE = "https://api.torn.com";
   const FF_BASE = "https://ffscouter.com/api/v1";
@@ -145,7 +145,8 @@
       keepReadyMin: 45
     },
     econ: {
-      mugMerits: 0
+      mugMerits: 0,
+      mugPlunder: 0
     },
     filters: {
       inTornOnly: {
@@ -1079,20 +1080,59 @@
       topItem: topItem
     };
   }
-  const MUG_CASH_CAP = 3584912846;
+  const MUG_BASE_LOW = 5;
+  const MUG_BASE_HIGH = 10;
+  const MUG_BASE_LIKELY = 6.5;
+  const MUG_MERIT_STEP = 5;
+  const MUG_PLUNDER_MAX = 49;
   function roundHalfAway(value, places) {
     const f = Math.pow(10, places);
     return (value < 0 ? -1 : 1) * (Math.round(Math.abs(value) * f) / f);
   }
-  function mugPercent(cash, merits) {
-    const mult = 1 + (toNumber(merits) || 0) / 10;
-    if (cash >= MUG_CASH_CAP) return mult;
-    return roundHalfAway(mult * (23 - Math.log(cash)), 2);
+  function mugMultiplier(econ) {
+    const e = econ || settings.econ || {};
+    const merits = clamp(Math.round(toNumber(e.mugMerits) || 0), 0, 10);
+    const plunder = clamp(toNumber(e.mugPlunder) || 0, 0, MUG_PLUNDER_MAX);
+    return 1 + merits * MUG_MERIT_STEP / 100 + plunder / 100;
   }
-  function mugTake(cash, merits) {
-    const c = toNumber(cash) || 0;
-    if (c <= 0) return 0;
-    return Math.floor(mugPercent(c, merits) * c / 100);
+  function mugBand(cash, econ) {
+    const c = Math.max(0, toNumber(cash) || 0);
+    const mult = mugMultiplier(econ);
+    const lowPct = roundHalfAway(MUG_BASE_LOW * mult, 2);
+    const highPct = roundHalfAway(MUG_BASE_HIGH * mult, 2);
+    const likelyPct = roundHalfAway(MUG_BASE_LIKELY * mult, 2);
+    return {
+      cash: c,
+      multiplier: mult,
+      lowPct: lowPct,
+      likelyPct: likelyPct,
+      highPct: highPct,
+      low: Math.floor(c * lowPct / 100),
+      likely: Math.floor(c * likelyPct / 100),
+      high: Math.floor(c * highPct / 100)
+    };
+  }
+  function mugPercent(cash, econ) {
+    return mugBand(cash, econ).likelyPct;
+  }
+  function mugTake(cash, econ) {
+    return mugBand(cash, econ).likely;
+  }
+  function formatPercent(value) {
+    return String(roundHalfAway(toNumber(value) || 0, 2));
+  }
+  function mugModifierLabel(econ) {
+    const e = econ || settings.econ || {};
+    const merits = clamp(Math.round(toNumber(e.mugMerits) || 0), 0, 10);
+    const plunder = clamp(toNumber(e.mugPlunder) || 0, 0, MUG_PLUNDER_MAX);
+    const parts = [];
+    if (merits) parts.push("Masterful Looting " + merits + "/10");
+    if (plunder) parts.push("Plunder " + formatPercent(plunder) + "%");
+    return parts.length ? parts.join(" + ") : "no mug bonuses";
+  }
+  function signedMoney(value) {
+    const v = toNumber(value) || 0;
+    return (v < 0 ? "-" : "+") + formatMoney(Math.abs(v));
   }
   function lootBreakdown(subject, econ) {
     const e = econ || settings.econ;
@@ -1107,7 +1147,15 @@
       unitDifference: 0,
       totalDifference: 0,
       gross: 0,
-      net: 0
+      grossLow: 0,
+      grossHigh: 0,
+      pct: 0,
+      pctLow: 0,
+      pctHigh: 0,
+      net: 0,
+      netLow: 0,
+      netHigh: 0,
+      mugBand: mugBand(0, e)
     };
     const spend = toNumber(subject && subject.value) || toNumber(onSale.buyout) || 0;
     if (spend <= 0) return empty;
@@ -1117,7 +1165,7 @@
     const worth = marketUnit > 0 ? marketUnit : price;
     const unitDifference = worth - price;
     const totalDifference = Math.floor(unitDifference * qty);
-    const gross = mugTake(spend, e.mugMerits);
+    const band = mugBand(spend, e);
     return {
       qty: qty,
       price: price,
@@ -1126,8 +1174,16 @@
       marketValue: Math.floor(worth * qty),
       unitDifference: unitDifference,
       totalDifference: totalDifference,
-      gross: gross,
-      net: totalDifference + gross
+      gross: band.likely,
+      grossLow: band.low,
+      grossHigh: band.high,
+      pct: band.likelyPct,
+      pctLow: band.lowPct,
+      pctHigh: band.highPct,
+      net: totalDifference + band.likely,
+      netLow: totalDifference + band.low,
+      netHigh: totalDifference + band.high,
+      mugBand: band
     };
   }
   function predictedLoot(subject, econ) {
@@ -1139,13 +1195,19 @@
     return {
       spend: d.spend,
       mugTargetCash: d.spend,
-      mugPercent: d.spend > 0 ? mugPercent(d.spend, e.mugMerits) : 0,
+      mugPercent: d.spend > 0 ? d.pct : 0,
+      mugPercentLow: d.spend > 0 ? d.pctLow : 0,
+      mugPercentHigh: d.spend > 0 ? d.pctHigh : 0,
       mugGross: d.gross,
       mugTake: d.gross,
+      mugGrossLow: d.grossLow,
+      mugGrossHigh: d.grossHigh,
       itemsWorth: d.marketValue,
       unitDifference: d.unitDifference,
       totalDifference: d.totalDifference,
       net: d.net,
+      netLow: d.netLow,
+      netHigh: d.netHigh,
       roi: d.spend > 0 ? d.net / d.spend : 0
     };
   }
@@ -4002,7 +4064,7 @@
       }
       const econ = estimateEconomics(su, settings.econ);
       if (econ.spend > 0) {
-        notes.push("Mug takes " + econ.mugPercent.toFixed(2) + "% of " + formatMoney(econ.mugTargetCash) + " = " + formatMoney(econ.mugGross) + " (merits " + (toNumber(settings.econ.mugMerits) || 0) + ")");
+        notes.push("A mug rolls " + formatPercent(econ.mugPercentLow) + "-" + formatPercent(econ.mugPercentHigh) + "% of " + formatMoney(econ.mugTargetCash) + ": " + formatMoney(econ.mugGrossLow) + " to " + formatMoney(econ.mugGrossHigh) + " (" + mugModifierLabel(settings.econ) + ")");
       }
       if (onSale.dealCount) notes.push(onSale.dealCount + " item(s) under market price");
       lootTd.title = notes.join("\n");
@@ -4019,18 +4081,35 @@
       }
     } else {
       const detail = su.lootDetail || lootBreakdown(su);
+      const band = detail.mugBand || mugBand(detail.spend, settings.econ);
       const positive = detail.net >= 0;
       lootPayTd.appendChild(el("span", {
         style: positive ? "color:var(--tb-ok);font-weight:600;" : "color:var(--tb-bad);font-weight:600;",
         text: (positive ? "+" : "") + formatMoney(detail.net)
       }));
-      const pct = su.value > 0 ? mugPercent(su.value, settings.econ.mugMerits) : 0;
       lootPayTd.appendChild(document.createElement("br"));
       lootPayTd.appendChild(el("span", {
         class: "tbms-hint",
-        text: pct ? pct.toFixed(2) + "%" : "-"
+        text: detail.spend > 0 ? formatPercent(band.lowPct) + "-" + formatPercent(band.highPct) + "% mug" : "-",
+        title: "Torn rolls the mug percentage, so the net profit is a band rather than one number."
       }));
-      lootPayTd.title = (su.listing ? su.listing.itemName : "Their stock") + "\n\nYou pay      " + formatMoney(detail.price) + " x " + detail.qty + " = " + formatMoney(detail.spend) + "\nMarket value " + formatMoney(detail.marketPrice || detail.price) + " x " + detail.qty + " = " + formatMoney(detail.marketValue) + "\n\nDifference   " + (detail.unitDifference >= 0 ? "+" : "-") + formatMoney(Math.abs(detail.unitDifference)) + " per item  x " + detail.qty + " = " + (detail.totalDifference >= 0 ? "+" : "-") + formatMoney(Math.abs(detail.totalDifference)) + "\nMug          +" + formatMoney(detail.gross) + "  (" + pct.toFixed(2) + "% with " + (toNumber(settings.econ.mugMerits) || 0) + " merits" + ")" + "\n\nNet profit   " + (detail.net >= 0 ? "+" : "-") + formatMoney(Math.abs(detail.net));
+      const title = [];
+      title.push(su.listing ? su.listing.itemName : "Their stock");
+      title.push("");
+      title.push("You pay      " + formatMoney(detail.price) + " x " + detail.qty + " = " + formatMoney(detail.spend));
+      title.push("Market value " + formatMoney(detail.marketPrice || detail.price) + " x " + detail.qty + " = " + formatMoney(detail.marketValue));
+      title.push("");
+      title.push("Difference   " + signedMoney(detail.unitDifference) + " per item  x " + detail.qty + " = " + signedMoney(detail.totalDifference));
+      title.push("");
+      title.push("Mug          " + formatPercent(band.lowPct) + "-" + formatPercent(band.highPct) + "% of the " + formatMoney(detail.spend) + " you hand over  (" + mugModifierLabel(settings.econ) + ")");
+      title.push("             worst    " + signedMoney(detail.grossLow) + "   (" + formatPercent(band.lowPct) + "%)");
+      title.push("             likely   " + signedMoney(detail.gross) + "   (" + formatPercent(band.likelyPct) + "%)");
+      title.push("             best     " + signedMoney(detail.grossHigh) + "   (" + formatPercent(band.highPct) + "%)");
+      title.push("");
+      title.push("Net profit   worst    " + signedMoney(detail.netLow));
+      title.push("             likely   " + signedMoney(detail.net));
+      title.push("             best     " + signedMoney(detail.netHigh));
+      lootPayTd.title = title.join("\n");
     }
     tr.appendChild(lootPayTd);
     const whyTd = el("td");
@@ -4365,10 +4444,11 @@
     });
     meritsRow.appendChild(el("label", {
       class: "tbms-label",
-      text: "Your Mugging merits (0-10)",
-      title: "Scales what a mug takes by 10% a point, using the game's own formula."
+      text: "Masterful Looting merits (0-10)",
+      title: "Each point adds 5% to what a mug takes, up to +50% at 10 points."
     }));
     const meritsInput = el("input", {
+      id: "tbms-merits",
       class: "tbms-num",
       type: "number",
       min: "0",
@@ -4383,6 +4463,34 @@
     });
     meritsRow.appendChild(meritsInput);
     keySec.appendChild(meritsRow);
+    const plunderRow = el("div", {
+      class: "tbms-row"
+    });
+    plunderRow.appendChild(el("label", {
+      class: "tbms-label",
+      text: "Plunder weapon bonus % (0-49)",
+      title: "The Plunder bonus on your weapon, if it has one. Added on top of the merits."
+    }));
+    const plunderInput = el("input", {
+      id: "tbms-plunder",
+      class: "tbms-num",
+      type: "number",
+      min: "0",
+      max: "49"
+    });
+    plunderInput.value = settings.econ.mugPlunder || 0;
+    plunderInput.addEventListener("change", function() {
+      const v = Number(plunderInput.value);
+      settings.econ.mugPlunder = isFinite(v) ? clamp(Math.round(v), 0, 49) : 0;
+      plunderInput.value = settings.econ.mugPlunder;
+      saveSettings();
+    });
+    plunderRow.appendChild(plunderInput);
+    plunderRow.appendChild(el("span", {
+      class: "tbms-suffix",
+      text: "blank or 0 if none"
+    }));
+    keySec.appendChild(plunderRow);
     const btnRow = el("div", {
       class: "tbms-row"
     });
@@ -4853,9 +4961,13 @@
       propertyLabel: propertyLabel,
       mugPercent: mugPercent,
       mugTake: mugTake,
+      mugBand: mugBand,
+      mugMultiplier: mugMultiplier,
+      mugModifierLabel: mugModifierLabel,
       lootBreakdown: lootBreakdown,
       predictedLoot: predictedLoot,
-      MUG_CASH_CAP: MUG_CASH_CAP,
+      MUG_BASE_LOW: MUG_BASE_LOW,
+      MUG_BASE_HIGH: MUG_BASE_HIGH,
       buildSubject: buildSubject,
       buildStubSubject: buildStubSubject,
       secondsUntilFree: secondsUntilFree,

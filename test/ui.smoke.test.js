@@ -1966,6 +1966,103 @@ t('a seller listing the item is a hit even when their bazaar is empty', async ()
   dom.window.close();
 });
 
+t('the profit cell shows the mug as a band, because Torn rolls it', async () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  // 30 of the item at 40k, so the row carries a real profit figure.
+  win.GM_xmlhttpRequest = (() => {
+    const base = win.GM_xmlhttpRequest;
+    return function (opts) {
+      if (/v2\/market\/206\/bazaar/.test(opts.url)) {
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify({ bazaar: [{ ID: 1111111, cost: 40000, quantity: 30 }] })
+            }),
+          0
+        );
+        return;
+      }
+      if (/api\.torn\.com\/user\/1111111\?/.test(opts.url)) {
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify({
+                player_id: 1111111,
+                name: 'starbug',
+                level: 20,
+                faction_id: 0,
+                status: { state: 'Okay', description: 'Okay' },
+                last_action: { timestamp: Math.floor(Date.now() / 1000) - 120 },
+                bazaar: []
+              })
+            }),
+          0
+        );
+        return;
+      }
+      return base(opts);
+    };
+  })();
+
+  doc.querySelector('.tbms-tab[data-tab="scan"]').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+  doc.getElementById('tbms-item-input').value = '206';
+  doc.getElementById('tbms-item-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 1, 9000, 'the seller to be checked');
+
+  const row = resultRows(doc)[0];
+  const cell = Array.from(row.querySelectorAll('td')).find((td) => /worst/i.test(td.title || ''));
+  assert.ok(cell, 'the loot cell carries the band: ' + row.textContent);
+
+  // On screen: the band, not a single made-up percentage.
+  assert.match(cell.textContent, /5-10% mug/, 'the band is on screen: ' + cell.textContent);
+
+  // In the tooltip: the three cases, each with its own rate.
+  assert.match(cell.title, /Mug +5-10% of the \$1\.20m you hand over +\(no mug bonuses\)/);
+  assert.match(cell.title, /worst +\+\$60\.0k +\(5%\)/);
+  assert.match(cell.title, /likely +\+\$78\.0k +\(6\.5%\)/);
+  assert.match(cell.title, /best +\+\$120\.0k +\(10%\)/);
+  assert.match(cell.title, /Net profit +worst +\+\$60\.0k/);
+  assert.match(cell.title, /likely +\+\$78\.0k/);
+  assert.match(cell.title, /best +\+\$120\.0k/);
+  dom.window.close();
+});
+
+t('the merits and Plunder fields live in Setup and stick', async () => {
+  const { dom, win, store } = boot();
+  const doc = win.document;
+
+  const merits = doc.getElementById('tbms-merits');
+  const plunder = doc.getElementById('tbms-plunder');
+  assert.ok(merits, 'the Masterful Looting field exists');
+  assert.ok(plunder, 'the Plunder field exists');
+  assert.equal(merits.getAttribute('type'), 'number');
+  assert.equal(plunder.getAttribute('type'), 'number');
+  assert.equal(merits.value, '0', 'nothing pre-filled');
+  assert.equal(plunder.value, '0');
+
+  merits.value = '10';
+  merits.dispatchEvent(new win.Event('change', { bubbles: true }));
+  plunder.value = '25';
+  plunder.dispatchEvent(new win.Event('change', { bubbles: true }));
+
+  await waitFor(() => /mugPlunder/.test(store.get('settings') || ''), 3000, 'the settings write');
+  const saved = JSON.parse(store.get('settings')).econ;
+  assert.equal(saved.mugMerits, 10);
+  assert.equal(saved.mugPlunder, 25);
+
+  // And nonsense is clamped rather than trusted.
+  plunder.value = '900';
+  plunder.dispatchEvent(new win.Event('change', { bubbles: true }));
+  assert.equal(plunder.value, '49', 'the weapon bonus cannot exceed the game cap');
+  dom.window.close();
+});
+
 t('repeating an item scan accumulates new names instead of repeating', async () => {
   const { dom, win } = boot();
   const doc = win.document;

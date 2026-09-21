@@ -399,8 +399,8 @@ net profit            total difference  +  what the mug returns
 ```
 
 Buying under the market value gains on every item; buying over it loses on
-every item. The mug is what offsets your outlay, and it is worked out with
-the game's own formula against what you hand over.
+every item. The mug is what offsets your outlay: Torn rolls 5-10% of the
+cash you hand them, and the figures below use the likely roll, 6.5%.
 
 Worked through:
 
@@ -408,8 +408,8 @@ Worked through:
 | --- | --- | --- |
 | difference +0/item | +20,500/item | -1,000,000/item |
 | x 18 = +0 | x 18 = +369,000 | x 1 = -1,000,000 |
-| mug +290,772 | mug +265,015 | mug +379,000 |
-| **net +290,772** | **net +634,015** | **net -621,000** |
+| mug +239,850 | mug +215,865 | mug +325,000 |
+| **net +239,850** | **net +584,865** | **net -675,000** |
 
 Overpaying comes out negative on its own, which is why there is no separate
 market-percentage rule any more.
@@ -480,44 +480,48 @@ button to copy it. That is the thing to send on when a lookup misbehaves.
 their stock, mug back the cash you just handed them, keep the goods. It is
 shown in the tooltip of the results column too.
 
-**The mug side is the game's own formula, not an estimate:**
+**The mug side follows the game's current rule, not the old curve:**
 
 ```
-FLOOR( ROUND((1 + merits/10) * (23 - LN(cash)), 2) * cash / 100 )   cash < 3,584,912,846
-FLOOR( cash / 100 * (1 + merits/10) )                               cash >= that
+5% - 10% of the target's cash on hand, rolled at random with the low end
+favoured: 6.5% is the middle of the curve, 10% is rare.
+
+Masterful Looting     +5% a point, up to +50% at 10/10
+Plunder weapon        +20% to +49% on top of that
 ```
 
-It is *computed* for whatever pile of cash is in front of it, every time -
-the rate falls continuously as the target holds more (11.28% at 123k, 9.18%
-at 1m, 7.58% at 5m, 1% at the cap) and scales with merits. Nothing is
-tabulated or hard-coded.
+Torn's patch #115 dropped the old `23 - ln(cash)` curve in 2019 and replaced
+it with that flat band, so the rate no longer shrinks as the target gets
+richer: a billionaire gives up 5-10% like anyone else. An older spreadsheet
+still using the log curve underestimates a big mug by roughly five times.
 
-Two things fall out of it. `LOG(x,10) x LN(10)` is just `LN(x)`, so the rate
-is `(23 - ln(cash))` percent and it **shrinks as the target holds more**.
-And the cap is exactly `e^22`, which is where that expression bottoms out at
-1%, so the two branches meet with no step between them.
-
-The practical consequence is the reason the price rule above exists: a mug
-returns **single-digit percent** of the cash, not a large fraction. At 5m
-it is 7.58%; at 1m it is 9.18%. So:
+The rate is a **roll**, so the tool never pretends to know it exactly. It
+shows the band - the worst, likely and best case - for whatever sum you hand
+over, and every figure is computed live:
 
 | | buy at 4m (market) | buy at 5m (25% over) |
 | --- | --- | --- |
 | spend | 4,000,000 | 5,000,000 |
-| mug returns | 312,000 (7.80%) | 379,000 (7.58%) |
+| mug returns (5% low / 6.5% likely / 10% high) | 200k / **260k** / 400k | 250k / **325k** / 500k |
 | goods worth | 4,000,000 | 4,000,000 |
-| **net** | **+312,000** | **-621,000** |
+| **net** | **+260,000** | **-675,000** |
+
+The mug is worked out on **what you pay**, not on the seller's balance - their
+cash is private, and the money you hand over is the part of it you can count
+on. Buy-mugging works precisely because that money lands on top of any mug
+protection they are carrying.
 
 Overpaying does not shave the profit, it turns it into a loss - which is why
 the price rule is on by default at 100%.
 
-**Mugging merits** are typed into Setup rather than read from your key. The
-API returns merits as numbered entries with no names attached, so there is
-nothing to match "Mugging" against. Each point scales the take by 10%, so 10
-points doubles it - but that still does not make a bad price good.
+**Mugging merits and a Plunder weapon** are typed into Setup rather than read
+from your key. The API returns merits as numbered entries with no names
+attached, so there is nothing to match "Mugging" against. Each Masterful
+Looting point adds 5% to the take, and a Plunder weapon adds up to 49% on
+top of that - but no bonus makes a bad price good.
 
-Your faction's cut and what a bought item is really worth to you remain
-editable assumptions, and they are yours rather than game constants.
+The mug bonus figures are yours to type in rather than guessed for you, and
+the market value of an item is taken from the listing itself.
 
 The script spaces Torn calls out (default 700 ms apart, capped at
 90/minute) and batches all FFScouter lookups into one request, so a page of
