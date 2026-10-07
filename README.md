@@ -113,6 +113,10 @@ Only the totals are kept, not the raw API payloads or the item lists, which
 works out at well under a kilobyte per seller. The store is capped at 200
 sellers and expires after 12 hours.
 
+The **Clear** button on the Results tab empties the list and forgets that
+stored scan, so it stays empty through a reload. It only touches the results
+- the watchlist is left exactly as it was.
+
 #### Nothing is skipped for having been seen
 
 There is deliberately **no "already checked" list**. Remembering who had

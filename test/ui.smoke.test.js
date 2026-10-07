@@ -1405,6 +1405,69 @@ t('the last scan comes back after the page reloads', async () => {
   second.dom.window.close();
 });
 
+t('a Clear button empties the results and leaves the watchlist alone', async () => {
+  const first = boot();
+  const doc = first.win.document;
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new first.win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 3, 8000, 'the scan');
+
+  // Watch one of them, so the other tab has something worth keeping.
+  const row = resultRows(doc)[0];
+  const watched = row.querySelector('a.tbms-link').textContent;
+  row.querySelectorAll('a.tbms-link').forEach((a) => {
+    if (/^watch$/i.test(a.textContent)) {
+      a.dispatchEvent(new first.win.MouseEvent('click', { bubbles: true }));
+    }
+  });
+  await waitFor(() => first.store.get('watch_v1') || null, 3000, 'the watch entry to be stored');
+  await waitFor(() => first.store.get('results_v1') || null, 3000, 'the results to be stored');
+
+  const clear = doc.getElementById('tbms-clear-btn');
+  assert.ok(clear, 'the results tab offers a Clear button');
+  clear.dispatchEvent(new first.win.MouseEvent('click', { bubbles: true }));
+
+  assert.equal(resultRows(doc).length, 0, 'the table is gone');
+  assert.match(
+    doc.querySelector('section[data-tab="results"]').textContent,
+    /No results yet/i,
+    'and the tab says why it is empty'
+  );
+  assert.equal(
+    doc.getElementById('tbms-badge').classList.contains('tbms-show'),
+    false,
+    'the match badge is cleared too'
+  );
+  assert.ok(!first.store.get('results_v1'), 'the stored scan is forgotten, not just hidden');
+
+  const watchRows = () => doc.querySelectorAll('section[data-tab="watch"] table.tbms-table tbody tr');
+  doc.querySelector('.tbms-tab[data-tab="watch"]').dispatchEvent(
+    new first.win.MouseEvent('click', { bubbles: true })
+  );
+  assert.equal(watchRows().length, 1, 'the watchlist survives');
+  assert.match(watchRows()[0].textContent, new RegExp(watched), 'still watching ' + watched);
+
+  // Reloading with the same storage must not bring the cleared list back.
+  const carried = {};
+  first.store.forEach((v, k) => {
+    if (k !== 'settings') carried[k] = v;
+  });
+  first.dom.window.close();
+
+  const second = boot(SEED_SETTINGS, carried);
+  assert.equal(resultRows(second.win.document).length, 0, 'the results stay cleared');
+  assert.doesNotMatch(
+    second.win.document.getElementById('tbms-foot').textContent,
+    /restored/i,
+    'and nothing is restored'
+  );
+  assert.equal(
+    second.win.document.querySelectorAll('section[data-tab="watch"] table.tbms-table tbody tr').length,
+    1,
+    'while the watch entry is still there'
+  );
+  second.dom.window.close();
+});
+
 t('restored results are re-scored against the filters as they are now', async () => {
   const first = boot();
   first.win.document

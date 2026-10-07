@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Buy-Mug Scout
 // @namespace    torn-buymugger-scout
-// @version      1.0.4
+// @version      1.0.5
 // @description  Flags buy-muggable bazaar sellers using FFScouter battle-stat estimates, with toggleable filters, a watchlist for players who are nearly back, and an in-page UI. If you enjoy it, send a Xanax to Egco [2598210].
 // @author       Egco [2598210]
 // @license      AGPL-3.0-or-later
@@ -42,7 +42,7 @@
 // service, must release their source under the same terms.
 (function() {
   "use strict";
-  const VERSION = "1.0.4";
+  const VERSION = "1.0.5";
   const STORE_PREFIX = "tbms_";
   const TORN_BASE = "https://api.torn.com";
   const FF_BASE = "https://ffscouter.com/api/v1";
@@ -3900,6 +3900,26 @@
       setStatus("CSV copied to clipboard.", "ok");
     });
     top.appendChild(csvBtn);
+    const clearBtn = el("button", {
+      id: "tbms-clear-btn",
+      class: "tbms-btn tbms-danger",
+      text: "Clear",
+      title: "Empty this list and forget the stored scan. Your watchlist is kept."
+    });
+    clearBtn.addEventListener("click", function() {
+      if (persistTimer) clearTimeout(persistTimer);
+      persistTimer = null;
+      rawDelete(RESULTS_KEY);
+      resetSubjects();
+      scan.results = [];
+      scan.emptyNote = null;
+      scan.lastLabel = "";
+      dismissResultsToast();
+      updateBadge(0);
+      renderResults();
+      setStatus("Results cleared. Your watchlist is untouched.", "info");
+    });
+    top.appendChild(clearBtn);
     s.appendChild(top);
     const rows = scan.results.filter(function(r) {
       return !settings.ui.onlyMatches || r.verdict.verdict === "match";
