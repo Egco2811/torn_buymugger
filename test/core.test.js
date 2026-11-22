@@ -1,18 +1,7 @@
-/* Tests for the pure logic in torn-buymugger-scout.user.js.
- * Run with:  node --test test/
- *
- * These exercise the parsing and filtering rules against Torn-shaped
- * payloads, so a change to the scoring/filters has to be deliberate.
- */
-
 const test = require('node:test');
 const assert = require('node:assert');
 
 const s = require('../torn-buymugger-scout.user.js');
-
-/* ------------------------------------------------------------------ */
-/* Seller harvesting                                                   */
-/* ------------------------------------------------------------------ */
 
 test('harvests seller IDs from the markup Torn actually renders', () => {
   const html = [
@@ -28,8 +17,7 @@ test('harvests seller IDs from the markup Torn actually renders', () => {
 });
 
 test('does not mistake an item id for a player id', () => {
-  // item.php?id= is an item, not a player. Harvesting it would waste API
-  // calls and pollute the results table.
+
   const html = '<a href="/item.php?id=206">Xanax</a> <a href="/imarket.php?id=206">market</a>';
   assert.deepEqual(s.extractIdsFromHtml(html), []);
 });
@@ -40,10 +28,6 @@ test('ignores nonsense ids', () => {
   assert.equal(s.isValidPlayerId(999999999), false);
   assert.equal(s.isValidPlayerId(12345), true);
 });
-
-/* ------------------------------------------------------------------ */
-/* Status / location                                                   */
-/* ------------------------------------------------------------------ */
 
 test('classifies Torn status states', () => {
   const cases = [
@@ -68,10 +52,6 @@ test('falls back to the description when state is missing', () => {
   assert.equal(st.available, false);
 });
 
-/* ------------------------------------------------------------------ */
-/* Vault detection                                                     */
-/* ------------------------------------------------------------------ */
-
 test('detects a vault across the payload shapes the API has used', () => {
   const topLevel = s.detectVault({ properties: { 1: { property: 'Castle' } }, vault: 5000000 });
   assert.equal(topLevel.hasVault, true);
@@ -92,10 +72,6 @@ test('reports no vault when there genuinely is none', () => {
   assert.equal(s.detectVault(null).hasVault, null);
 });
 
-/* ------------------------------------------------------------------ */
-/* Bazaar economics                                                    */
-/* ------------------------------------------------------------------ */
-
 test('summarises bazaar value, deals and worthy stock', () => {
   const items = [
     { ID: 206, name: 'Xanax', quantity: 10, price: 800000, market_price: 850000 },
@@ -112,7 +88,7 @@ test('summarises bazaar value, deals and worthy stock', () => {
   assert.equal(sum.worthyCount, 12, 'Xanax + Bargain clear the 100k bar');
   assert.equal(sum.dealCount, 2, 'only Bargain is >=15% under market');
   assert.equal(sum.dealBuyout, 2000000);
-  // Biggest single line by value: 10 Xanax @ 800k beats 2 Bargains @ 1m.
+
   assert.equal(sum.topItem.name, 'Xanax');
   assert.equal(sum.topItem.value, 8000000);
 });
@@ -127,18 +103,6 @@ test('survives an empty or malformed bazaar', () => {
   assert.equal(s.summariseBazaar([null, 'x'], { worthyUnitPrice: 1000, dealDiscount: 0.1 }).count, 0);
 });
 
-/* ------------------------------------------------------------------ */
-/* Bazaar listing payloads - every shape Torn has used                 */
-/* ------------------------------------------------------------------ */
-
-/* ------------------------------------------------------------------ */
-/* Paying above market                                                 */
-/* ------------------------------------------------------------------ */
-
-/* --- A seller row whose listing details are nested ------------------
- * This is the shape that produced a real player id with no price and no
- * quantity, which rendered as "null x" and valued the seller at $0.
- */
 test('finds the price and quantity even when they are nested', () => {
   const shapes = [
     [{ ID: 3916729, cost: 800000, quantity: 5 }],
@@ -162,7 +126,7 @@ test('a row with no price anywhere is left without one, not guessed at', () => {
 });
 
 test('a seller with no usable price is not valued at zero', () => {
-  // The guard that stops "null x" reaching the table.
+
   const subject = s.buildSubject(
     3916729,
     { name: 'PremAssassin', bazaar: [], __tbmsSelections: 'profile,basic,bazaar' },
@@ -176,13 +140,8 @@ test('a seller with no usable price is not valued at zero', () => {
   assert.match(subject.valueUnknownReason, /without a price and quantity/);
 });
 
-/* ------------------------------------------------------------------ */
-/* The mugging formula                                                 */
-/* ------------------------------------------------------------------ */
-
 test('a mug takes a flat 5% to 10% of the wallet, rolled at random', () => {
-  // Torn's patch #115 dropped the old log curve for a flat band, and the
-  // roll is weighted towards the low end.
+
   const b = s.mugBand(1000000, {});
   assert.equal(b.lowPct, 5);
   assert.equal(b.likelyPct, 6.5);
@@ -195,7 +154,7 @@ test('a mug takes a flat 5% to 10% of the wallet, rolled at random', () => {
 });
 
 test('the band is a rate, so it does not shrink on a richer target', () => {
-  // The old formula paid ~1% on a billionaire; the game still pays 5-10%.
+
   assert.equal(s.mugPercent(1000000000, {}), 6.5);
   assert.equal(s.mugPercent(100, {}), 6.5);
   assert.equal(s.mugTake(1000000000, {}), 65000000);
@@ -205,14 +164,14 @@ test('Masterful Looting adds 5% a point and Plunder stacks on top', () => {
   assert.equal(s.mugMultiplier({ mugMerits: 10 }), 1.5);
   assert.equal(s.mugPercent(1000000, { mugMerits: 10 }), 9.75, '6.5 x 1.5');
   assert.equal(s.mugBand(1000000, { mugMerits: 10 }).highPct, 15, 'the band at 10/10');
-  // The wiki's worst case: 10/10 merits plus a 49% Plunder weapon.
+
   assert.equal(s.mugMultiplier({ mugMerits: 10, mugPlunder: 49 }), 1.99);
   assert.equal(s.mugBand(1000000, { mugMerits: 10, mugPlunder: 49 }).highPct, 19.9);
   assert.equal(s.mugMultiplier({ mugMerits: 99, mugPlunder: -5 }), 1.5, 'both inputs clamp');
 });
 
 test('the payout is floored, not rounded', () => {
-  // FLOOR(6.5 x 1,000,001 / 100) = 65,000 (the .065 is dropped)
+
   assert.equal(s.mugTake(1000001, {}), 65000);
   assert.equal(s.mugTake(1000000, {}), 65000);
 });
@@ -224,7 +183,7 @@ test('mugging nothing pays nothing', () => {
 });
 
 test('an overpriced listing shows up as a negative net profit', () => {
-  // The case that started this: an item listed at 5m against a 4m market.
+
   const at = (price) => {
     const ls = s.summariseBazaar(
       [{ name: 'E-DVD', price: price, quantity: 1, market_price: 4000000 }],
@@ -252,7 +211,7 @@ test('an overpriced listing shows up as a negative net profit', () => {
 });
 
 test('under market, the difference per item is a gain on every item', () => {
-  // Their formula: (market - price) x qty, plus the mug.
+
   const ls = s.summariseBazaar(
     [{ name: 'Pangolin Scales', price: 184500, quantity: 18, market_price: 205000 }],
     {}
@@ -273,7 +232,7 @@ test('under market, the difference per item is a gain on every item', () => {
 });
 
 test('a seller at exactly market value still yields the mug', () => {
-  // The report's case: 18 x 205,000 against a 205,000 market.
+
   const ls = s.summariseBazaar(
     [{ name: 'Pangolin Scales', price: 205000, quantity: 18, market_price: 205000 }],
     {}
@@ -290,8 +249,7 @@ test('a seller at exactly market value still yields the mug', () => {
 });
 
 test('the loot figure is what separates a good price from a bad one', () => {
-  // No market-percentage rule is needed once the loot is netted off: the
-  // overpay shows up on its own.
+
   const at = (price) =>
     (() => {
       const ls = s.summariseBazaar([{ price: price, quantity: 1, market_price: 4000000 }], {});
@@ -335,7 +293,7 @@ test('the estimate spends the listing price', () => {
   const est = s.estimateEconomics(subject, { mugMerits: 0, factionCut: 0, liquidation: 1 });
 
   assert.equal(est.spend, 1000000, 'the asking price times the quantity');
-  // 6.5% of 1m, floored.
+
   assert.equal(est.mugPercent, 6.5);
   assert.equal(est.mugTake, 65000);
   assert.equal(est.unitDifference, 20000, '20k under market per item');
@@ -375,8 +333,7 @@ test('reads a map keyed by seller id', () => {
 });
 
 test('never mistakes the item id for a seller id', () => {
-  // A user's own bazaar lists items as {ID: <item id>}; reading that as a
-  // player would send us looking up item 206 as a person.
+
   const rows = s.normaliseBazaarRows(
     { bazaar: [{ ID: 206, name: 'Xanax', quantity: 5, price: 800000 }] },
     206
@@ -430,10 +387,6 @@ test('reads where a player lives from a v2 property payload', () => {
   assert.equal(s.propertyLabel({ properties: {} }), null);
 });
 
-/* ------------------------------------------------------------------ */
-/* Estimate model                                                      */
-/* ------------------------------------------------------------------ */
-
 test('the estimate follows the mug-and-keep-the-goods model', () => {
   const subject = {
     money: 0,
@@ -449,7 +402,7 @@ test('the estimate follows the mug-and-keep-the-goods model', () => {
 
   const est = s.estimateEconomics(subject, econ);
   assert.equal(est.spend, 1000000);
-  // The game's band: 5-10% of what you hand over, the roll favouring 5%.
+
   assert.equal(est.mugPercent, 6.5);
   assert.equal(est.mugTake, 65000);
   assert.equal(est.net, 65000, 'mug 65k, hand back the same 1m in goods');
@@ -472,11 +425,6 @@ test('the faction cut reduces the take', () => {
   assert.equal(est.net, 0);
 });
 
-/* ------------------------------------------------------------------ */
-/* Shared fixtures for the loot arithmetic                             */
-/* ------------------------------------------------------------------ */
-
-/* The bazaar from the report, in the shape that used to parse as empty. */
 const FIVE_ITEMS = [
   { ID: 1, name: 'Hydrogen Tank', quantity: 6, price: 25760, market_price: 23000 },
   { ID: 2, name: 'Spy Camera', quantity: 3, price: 492, market_price: 480 },
@@ -487,7 +435,6 @@ const FIVE_ITEMS = [
 
 const ECON = { mugMerits: 0, factionCut: 0, liquidation: 1 };
 
-/** A subject as a scan would build one for an item search. */
 function listingSubject(price, marketPrice, qty) {
   const listing = { itemName: 'E-DVD', price: price, qty: qty, marketPrice: marketPrice };
   const summary = s.summariseBazaar(
@@ -498,7 +445,7 @@ function listingSubject(price, marketPrice, qty) {
 }
 
 test('paying above market turns a profit into a loss', () => {
-  // The case that started this: an item listed at 5m against a 4m market.
+
   const at = (price) => s.estimateEconomics(listingSubject(price, 4000000, 1), ECON);
 
   const market = at(4000000);
@@ -527,17 +474,11 @@ test('mugging merits scale the take but cannot rescue an overpay', () => {
       liquidation: 1
     });
 
-  // Merits scale half the take again at 10 points.
   assert.equal(at(4000000, 0).mugTake, 260000);
   assert.equal(at(4000000, 10).mugTake, 390000);
 
-  // Even fully merited, overpaying by 25% still loses money here.
   assert.ok(at(5000000, 10).net < 0, 'a maxed merit does not make a bad price good');
 });
-
-/* ------------------------------------------------------------------ */
-/* Estimate model                                                      */
-/* ------------------------------------------------------------------ */
 
 test('a bazaar is read whether it arrives as an array or a map', () => {
   assert.equal(s.normaliseUser({ bazaar: FIVE_ITEMS }).bazaar.length, 5, 'array form');
@@ -565,7 +506,7 @@ test('toItemArray copes with anything rather than throwing', () => {
 });
 
 test('only the searched item is valued, not the whole bazaar', () => {
-  // The report's bazaar: 18 pangolin scales plus 12 other items.
+
   const subject = s.buildSubject(4425009, { bazaar: FIVE_ITEMS }, null, null, null, 4);
 
   assert.equal(subject.bazaar.buyout, 6 * 25760 + 3 * 492 + 2 * 23252 + 18 * 205000 + 414);
@@ -574,7 +515,6 @@ test('only the searched item is valued, not the whole bazaar', () => {
   assert.equal(subject.value, 3690000, 'the rest of their stock is excluded');
   assert.equal(subject.valueSource, 'bazaar line');
 
-  // And the loot follows the same figure.
   const d = s.lootBreakdown(subject);
   assert.equal(d.spend, 3690000);
   assert.equal(d.net, s.mugTake(3690000, ECON), 'at market, the mug is the profit');
@@ -588,7 +528,7 @@ test('a different item in the same bazaar gives a different figure', () => {
 });
 
 test('without an item selected there is nothing to value', () => {
-  // A page scan has no item context, so no profit can be claimed.
+
   const subject = s.buildSubject(1, { bazaar: FIVE_ITEMS }, null, null, null, null);
   assert.equal(subject.value, 0);
   assert.equal(subject.valueUnknown, true);
@@ -634,8 +574,7 @@ test('a listing still counts even when the bazaar was not returned', () => {
 });
 
 test('an unvalued seller passes the value filter rather than being blamed', () => {
-  // A missing measurement is not a seller holding nothing. Failing them on
-  // it would reject every row a page scan turned up.
+
   const subject = makeSubject({
     value: 0,
     valueUnknown: true,
@@ -656,9 +595,7 @@ test('an unvalued seller passes the value filter rather than being blamed', () =
 });
 
 test('a seller found by a listing is judged on that listing, not their bazaar', () => {
-  // The reported case: 30 pangolin scales at the going rate, in Torn and
-  // out of hospital, vault ignored - but their bazaar lookup came back
-  // empty, so judging them on their bazaar scored them at zero.
+
   const emptyBazaar = s.summariseBazaar([], {});
   const listing = { itemId: 780, itemName: 'Pangolin Scales', price: 40000, qty: 30, marketPrice: 40000 };
   const listingSummary = s.summariseBazaar(
@@ -688,7 +625,7 @@ test('a seller found by a listing is judged on that listing, not their bazaar', 
 });
 
 test('an empty bazaar no longer reads as an empty bank', () => {
-  // The old failure mode: bazaar empty -> value 0 -> rejected on value.
+
   const subject = makeSubject({
     bazaar: s.summariseBazaar([], {}),
     listing: { itemId: 780, itemName: 'Pangolin Scales', price: 40000, qty: 30, marketPrice: 40000 },
@@ -730,10 +667,9 @@ test('the estimate spends the listing price, not a whole-bazaar basket', () => {
   );
 
   assert.equal(est.spend, 1200000, '30 x 40k');
-  // The mug is computed on what you hand over, since their own cash is
-  // never visible - note the ignored money field above.
+
   assert.equal(est.mugTargetCash, 1200000);
-  // 6.5% of 1,200,000 = 78,000, with the band either side of it.
+
   assert.equal(est.mugPercent, 6.5);
   assert.equal(est.mugGross, 78000);
   assert.equal(est.mugGrossLow, 60000);
@@ -750,8 +686,7 @@ function makeSubject(overrides = {}) {
     lastActionAgo: 60,
     publicBs: null,
     vault: { hasVault: false, vaultAmount: null },
-    // The money that moves: what they have on sale, which for an item scan
-    // is the listing we found them through.
+
     listing: { itemId: 206, itemName: 'Xanax', price: 800000, qty: 60, marketPrice: 850000 },
     listingSummary: {
       items: [],
@@ -833,10 +768,6 @@ test('a hospitalised player is rejected when the filter is on', () => {
   assert.equal(v.verdict, 'reject');
   assert.ok(v.reasons.includes('hospitalised'));
 });
-
-/* ------------------------------------------------------------------ */
-/* The "soon" exceptions                                               */
-/* ------------------------------------------------------------------ */
 
 function inMinutes(mins, state, description) {
   const until = Math.floor(Date.now() / 1000) + mins * 60;
@@ -923,13 +854,13 @@ test('a long hospital stay is still rejected', () => {
 });
 
 test('a state with no end time cannot qualify as soon', () => {
-  // Federal jail has no release time in the payload.
+
   const subject = makeSubject({
     status: s.readStatus({ status: { state: 'Federal', description: 'Federal jail' } })
   });
   const v = s.evaluateTarget(subject, { settings: settingsWith() });
   assert.equal(v.verdict, 'reject');
-  // The explicit state must win: "Federal jail" is federal, not ordinary jail.
+
   assert.ok(v.reasons.includes('federal'), JSON.stringify(v.reasons));
 });
 
@@ -1047,14 +978,6 @@ test('min score filter is applied last and is toggleable', () => {
   assert.equal(off.verdict, 'match');
 });
 
-/* ------------------------------------------------------------------ */
-/* Subject building                                                    */
-/* ------------------------------------------------------------------ */
-
-/* --- API v1 vs v2 payload shapes -----------------------------------
- * v1 merges every selection into one flat object; v2 nests them. Reading
- * only one shape is what produced nameless rows in the wild.
- */
 const V1_FLAT_USER = {
   player_id: 1234567,
   name: 'Flat Sam',
@@ -1107,7 +1030,7 @@ test('a v1 flat payload produces a properly named, located subject', () => {
 });
 
 test('the last action object is not mistaken for a timestamp', () => {
-  // Reading the object directly used to produce NaN -> "unknown".
+
   const subject = s.buildSubject(1, V1_FLAT_USER, null);
   assert.notEqual(subject.lastActionAgo, null);
 });
@@ -1154,14 +1077,6 @@ test('hidden battle stats fall back to the FF estimate', () => {
   assert.equal(subject.publicBs, null);
   assert.equal(subject.ff.bsEstimate, 123456789);
 });
-
-/* ------------------------------------------------------------------ */
-/* Helpers / settings migration                                        */
-/* ------------------------------------------------------------------ */
-
-/* ------------------------------------------------------------------ */
-/* The packed "already checked" record                                 */
-/* ------------------------------------------------------------------ */
 
 test('parses the numeric shapes Torn returns', () => {
   assert.equal(s.toNumber('1,234,567'), 1234567);

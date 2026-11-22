@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Buy-Mug Scout
 // @namespace    torn-buymugger-scout
-// @version      1.0.5
+// @version      1.0.9
 // @description  Flags buy-muggable bazaar sellers using FFScouter battle-stat estimates, with toggleable filters, a watchlist for players who are nearly back, and an in-page UI. If you enjoy it, send a Xanax to Egco [2598210].
 // @author       Egco [2598210]
 // @license      AGPL-3.0-or-later
@@ -13,6 +13,7 @@
 // @grant        GM_deleteValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
+// @grant        GM_setClipboard
 // @grant        GM_registerMenuCommand
 // @connect      api.torn.com
 // @connect      ffscouter.com
@@ -20,29 +21,9 @@
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
-
-// Torn Buy-Mug Scout - open source, free software, no charge, no warranty.
-// Copyright (C) 2026 Egco [2598210]
-//
-// This program is free software: you can redistribute it and/or modify it
-// under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or (at your
-// option) any later version.
-//
-// This program is distributed in the hope that it will be useful, but
-// WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero
-// General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
-//
-// The AGPL is the strongest copyleft licence in common use: anyone who
-// redistributes this, or runs a modified version of it as a network
-// service, must release their source under the same terms.
 (function() {
   "use strict";
-  const VERSION = "1.0.5";
+  const VERSION = "1.0.9";
   const STORE_PREFIX = "tbms_";
   const TORN_BASE = "https://api.torn.com";
   const FF_BASE = "https://ffscouter.com/api/v1";
@@ -61,9 +42,20 @@
   const FOOTER_BTN_ID = "tbms-footer-btn";
   const PANEL_W = 700;
   const WEAV3R_BASE = "https://weav3r.dev/api";
+  const SWEEP_INDEX_KEY = "sweep_index_v1";
+  const SWEEP_INDEX_TTL_MS = 10 * 60 * 1e3;
+  const SWEEP_STATE_KEY = "sweep_state_v1";
+  const SWEEP_PAGE_LIMIT = 100;
+  const SWEEP_ITEM_DELAY_MS = 700;
+  const SWEEP_PAGE_TTL_MS = 90 * 1e3;
+  const SWEEP_BACKOFF_MS = 45e3;
+  const SWEEP_MAX_ITEMS_PER_PASS = 200;
+  const SWEEP_RESULT_CAP = 240;
   const AUTHOR_NAME = "Egco";
   const AUTHOR_ID = "2598210";
   const TIP_LINE = "If you enjoyed this, send " + AUTHOR_NAME + " [" + AUTHOR_ID + "] a Xanax - it is always appreciated.";
+
+  const SELF_IDS = [ AUTHOR_ID ];
   const hasGM = typeof GM_getValue === "function" && typeof GM_setValue === "function";
   function rawGet(key) {
     try {
@@ -132,8 +124,13 @@
       fetchProperty: true,
       useWeav3r: true,
       lastItemId: 0,
+      itemQuery: "",
+      sweep: {
+        perPass: 100
+      },
       auto: {
         on: false,
+        mode: "item",
         itemId: 0,
         intervalSec: 60
       }
@@ -172,6 +169,10 @@
       minBazaarValue: {
         on: false,
         value: 1e6
+      },
+      maxSpend: {
+        on: false,
+        value: 1e8
       },
       minLoot: {
         on: false,
@@ -260,10 +261,79 @@
   }
   let settings = mergeDefaults(DEFAULT_SETTINGS, loadJSON(SETTINGS_KEY, {}));
   let saveTimer = null;
+  let syncReady = false;
+  let applyingRemote = false;
+  const syncRaw = {};
+  function syncMark(key) {
+    syncRaw[key] = rawGet(key);
+  }
+  function syncReloadResults() {
+    if (persistTimer) {
+      clearTimeout(persistTimer);
+      persistTimer = null;
+    }
+    applyingRemote = true;
+    try {
+      resetSubjects();
+      scan.results = [];
+      scan.emptyNote = null;
+      scan.lastLabel = "";
+      restoreResults();
+    } finally {
+      applyingRemote = false;
+    }
+    renderResults();
+    updateBadge(scan.results.filter(function(r) {
+      return r.verdict.verdict === "match";
+    }).length);
+  }
+  function syncReloadWatch() {
+    watchlist = loadJSON(WATCH_KEY, {});
+    renderWatchTab();
+    paintWatchTab();
+  }
+  function syncReloadSettings() {
+    applyingRemote = true;
+    try {
+      const localUi = settings.ui;
+      settings = mergeDefaults(DEFAULT_SETTINGS, loadJSON(SETTINGS_KEY, {}));
+      settings.ui = localUi;
+      renderScanTab();
+      renderFiltersTab();
+      paintAutoButton();
+      if (settings.scan.auto.on && (settings.scan.auto.mode === "sweep" || settings.scan.auto.itemId)) scheduleAutoScan(autoIntervalMs());
+    } finally {
+      applyingRemote = false;
+    }
+    toastSignature = "";
+  }
+  function checkRemoteSync() {
+    if (!syncReady) return;
+    let changed = false;
+    [ RESULTS_KEY, WATCH_KEY, SETTINGS_KEY ].forEach(function(key) {
+      const cur = rawGet(key);
+      if (cur === syncRaw[key]) return;
+      syncRaw[key] = cur;
+      changed = true;
+      if (key === RESULTS_KEY) syncReloadResults();
+      else if (key === WATCH_KEY) syncReloadWatch();
+      else syncReloadSettings();
+    });
+    if (changed) setStatus("Picked up changes from another tab.", "info");
+  }
+  function startSyncWatcher() {
+    syncMark(RESULTS_KEY);
+    syncMark(WATCH_KEY);
+    syncMark(SETTINGS_KEY);
+    syncReady = true;
+    window.addEventListener("storage", checkRemoteSync);
+    setInterval(checkRemoteSync, 1500);
+  }
   function saveSettings() {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(function() {
       saveJSON(SETTINGS_KEY, settings);
+      syncMark(SETTINGS_KEY);
     }, 150);
   }
   let cache = loadJSON(CACHE_KEY, {});
@@ -299,38 +369,56 @@
   const hasGMX = typeof GM_xmlhttpRequest === "function";
   function httpGet(url) {
     return new Promise(function(resolve, reject) {
+      let settled = false;
+      let timer = null;
+      const finish = function(fn, arg) {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        fn(arg);
+      };
+
+      timer = setTimeout(function() {
+        finish(reject, new Error("Timed out contacting " + hostOf(url)));
+      }, 25e3);
       if (hasGMX) {
-        GM_xmlhttpRequest({
-          method: "GET",
-          url: url,
-          timeout: 25e3,
-          headers: {
-            Accept: "application/json"
-          },
-          onload: function(res) {
-            resolve({
-              status: res.status,
-              text: res.responseText || ""
-            });
-          },
-          onerror: function() {
-            reject(new Error("Network error contacting " + hostOf(url)));
-          },
-          ontimeout: function() {
-            reject(new Error("Timed out contacting " + hostOf(url)));
-          }
-        });
+        try {
+          GM_xmlhttpRequest({
+            method: "GET",
+            url: url,
+            timeout: 25e3,
+            headers: {
+              Accept: "application/json"
+            },
+            onload: function(res) {
+              finish(resolve, {
+                status: res.status,
+                text: res.responseText || ""
+              });
+            },
+            onerror: function() {
+              finish(reject, new Error("Network error contacting " + hostOf(url)));
+            },
+            ontimeout: function() {
+              finish(reject, new Error("Timed out contacting " + hostOf(url)));
+            }
+          });
+        } catch (e) {
+          finish(reject, e);
+        }
       } else {
         fetch(url, {
           credentials: "omit"
         }).then(function(r) {
           return r.text().then(function(t) {
-            resolve({
+            finish(resolve, {
               status: r.status,
               text: t
             });
           });
-        }).catch(reject);
+        }).catch(function(e) {
+          finish(reject, e);
+        });
       }
     });
   }
@@ -616,20 +704,57 @@
     diagnostics.lastRaw = (text || "").slice(0, 4e3);
     diagnostics.lastRawLabel = label;
   }
-  async function weav3rItemIndex() {
+  function weav3rError(message) {
+    const e = new Error(message);
+    if (/too many|rate.?limit/i.test(String(message || ""))) e.rateLimit = true;
+    return e;
+  }
+  function weav3rResponseError(data) {
+    if (!data || !data.error) return null;
+    const msg = typeof data.error === "string" ? data.error : data.error.error || JSON.stringify(data.error);
+    return weav3rError(msg);
+  }
+  function slimMarketItem(it) {
+    if (!it || it.item_id == null || it.item_id <= 0) return null;
+    return {
+      item_id: toNumber(it.item_id),
+      item_name: it.item_name || "Item " + it.item_id,
+      market_price: toNumber(it.market_price),
+      bazaar_average: toNumber(it.bazaar_average),
+      lowest_price: toNumber(it.lowest_price),
+      total_bazaars: toNumber(it.total_bazaars) || 0
+    };
+  }
+  async function weav3rMarketIndex(force) {
+    const cached = loadJSON(SWEEP_INDEX_KEY, null);
+    if (!force && cached && Array.isArray(cached.items) && cached.items.length && Date.now() - (cached.at || 0) < SWEEP_INDEX_TTL_MS) {
+      return cached;
+    }
     const res = await httpGet(WEAV3R_BASE + "/marketplace?limit=2000");
+    if (res.status === 429) throw weav3rError("the scanner is rate limiting (HTTP 429)");
+    if (res.status !== 200) throw new Error("the item index answered HTTP " + res.status);
     let data;
     try {
       data = JSON.parse(res.text);
     } catch (e) {
       throw new Error("the item index was unreadable");
     }
+    const failed = weav3rResponseError(data);
+    if (failed) throw failed;
     const list = data && data.items;
     if (!Array.isArray(list) || !list.length) throw new Error("no items in the response");
+    const out = {
+      at: Date.now(),
+      items: list.map(slimMarketItem).filter(Boolean)
+    };
+    saveJSON(SWEEP_INDEX_KEY, out);
+    return out;
+  }
+  async function weav3rItemIndex() {
+    const index = await weav3rMarketIndex();
     const out = {};
-    list.forEach(function(it) {
-      if (!it || it.item_id == null || it.item_id <= 0) return;
-      out[it.item_id] = it.item_name || "Item " + it.item_id;
+    index.items.forEach(function(it) {
+      out[it.item_id] = it.item_name;
     });
     return out;
   }
@@ -746,8 +871,9 @@
     });
     return out;
   }
-  async function weav3rBazaarSellers(itemId) {
-    const res = await httpGet(WEAV3R_BASE + "/marketplace/" + itemId + "?limit=100");
+  async function weav3rListingPage(itemId) {
+    const res = await httpGet(WEAV3R_BASE + "/marketplace/" + itemId + "?limit=" + SWEEP_PAGE_LIMIT);
+    if (res.status === 429) throw weav3rError("the scanner is rate limiting (HTTP 429)");
     if (res.status !== 200) {
       throw new Error("the scanner answered HTTP " + res.status);
     }
@@ -757,16 +883,24 @@
     } catch (e) {
       throw new Error("the scanner returned something unreadable");
     }
+    const failed = weav3rResponseError(data);
+    if (failed) throw failed;
     if (!data || !Array.isArray(data.listings)) {
       throw new Error("the scanner returned no listings");
     }
     const sellers = normaliseBazaarRows(data, itemId);
     if (!sellers.length) rememberRaw("weav3r marketplace " + itemId, data);
     return {
+      itemName: data.item_name || null,
       marketPrice: toNumber(data.market_price),
       bazaarAverage: toNumber(data.bazaar_average),
+      totalCount: toNumber(data.total_count),
+      hasMore: !!data.has_more,
       sellers: sellers
     };
+  }
+  async function weav3rBazaarSellers(itemId) {
+    return weav3rListingPage(itemId);
   }
   async function findBazaarSellers(itemId) {
     const attempts = [];
@@ -842,8 +976,15 @@
     if (!sellers.length) rememberRaw("market " + itemId + " (v2)", res.data);
     return sellers;
   }
+  function pageHref() {
+    try {
+      return String(window.location && window.location.href || "");
+    } catch (e) {
+      return "";
+    }
+  }
   function currentItemId() {
-    const href = window.location.href;
+    const href = pageHref();
     const m = href.match(/[?&#/]itemID=(\d+)/i) || href.match(/item\.php\?id=(\d+)/i) || href.match(/[?&#/]item_?id=(\d+)/i);
     return m ? toNumber(m[1]) : null;
   }
@@ -1285,6 +1426,11 @@
     } else if (f.minBazaarValue.on) {
       pass.push("on sale " + formatMoney(onSaleValue));
     }
+    if (f.maxSpend.on && !subject.valueUnknown && onSaleValue > f.maxSpend.value) {
+      fail.push("spend " + formatMoney(onSaleValue));
+    } else if (f.maxSpend.on && !subject.valueUnknown) {
+      pass.push("spend " + formatMoney(onSaleValue));
+    }
     if (f.minLoot.on && loot < f.minLoot.value) {
       fail.push("loot " + formatMoney(loot));
     } else if (f.minLoot.on) {
@@ -1406,7 +1552,12 @@
     return Number.isInteger(id) && id > 0 && id <= 99999999;
   }
   function isSelf(id) {
-    return !!settings.me.id && Number(id) === Number(settings.me.id);
+    const n = Number(id);
+    if (!n) return false;
+    for (let i = 0; i < SELF_IDS.length; i++) {
+      if (Number(SELF_IDS[i]) === n) return true;
+    }
+    return !!settings.me.id && n === Number(settings.me.id);
   }
   function buildSubject(id, torn, ff, nameHint, listing, itemId) {
     const u = normaliseUser(torn);
@@ -1515,6 +1666,10 @@
       bsHuman: known.bsHuman || null,
       source: known.source || null
     };
+    if (row && row.listing) {
+      subject.listing = row.listing;
+      subject.itemId = toNumber(row.listing.itemId) || 0;
+    }
     subject.screenedOut = true;
     return subject;
   }
@@ -1530,7 +1685,24 @@
     lastLabel: ""
   };
   function addSubject(subject) {
-    if (!subject || scan.seenIds[subject.id]) return false;
+    if (!subject) return false;
+    if (scan.seenIds[subject.id]) {
+      let at = -1;
+      for (let i = 0; i < scan.subjects.length; i++) {
+        if (scan.subjects[i].id === subject.id) {
+          at = i;
+          break;
+        }
+      }
+      if (at === -1) return false;
+      const cur = scan.subjects[at];
+      const newHasListing = !!(subject.listing && !subject.lookupError);
+      const oldHasListing = !!(cur.listing && !cur.lookupError);
+      const better = newHasListing && (!oldHasListing || (toNumber(subject.loot) || 0) > (toNumber(cur.loot) || 0));
+      if (!better) return false;
+      scan.subjects[at] = subject;
+      return true;
+    }
     scan.seenIds[subject.id] = true;
     scan.subjects.push(subject);
     return true;
@@ -1587,7 +1759,9 @@
     };
   }
   let persistTimer = null;
+  let restoring = false;
   function schedulePersistResults() {
+    if (applyingRemote || restoring) return;
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(function() {
       persistTimer = null;
@@ -1598,6 +1772,7 @@
         label: scan.lastLabel || "",
         subjects: scan.subjects.slice(0, RESULTS_CAP).map(slimSubject)
       });
+      syncMark(RESULTS_KEY);
     }, 400);
   }
   function restoreResults() {
@@ -1605,16 +1780,72 @@
     if (!saved || !Array.isArray(saved.subjects) || !saved.subjects.length) return 0;
     if (saved.v !== RESULTS_SHAPE) return 0;
     if (Date.now() - (saved.at || 0) > RESULTS_TTL_MS) return 0;
-    resetSubjects();
-    saved.subjects.forEach(function(s) {
-      if (!s || !s.id) return;
-      if (s.listing && (s.listing.price == null || s.listing.qty == null)) s.listing = null;
-      scan.seenIds[s.id] = true;
-      scan.subjects.push(s);
-    });
-    scan.lastLabel = saved.label || "";
-    applyVerdicts();
-    return scan.subjects.length;
+    restoring = true;
+    try {
+      resetSubjects();
+      saved.subjects.forEach(function(s) {
+        if (!s || !s.id) return;
+        if (s.listing && (s.listing.price == null || s.listing.qty == null)) s.listing = null;
+        scan.seenIds[s.id] = true;
+        scan.subjects.push(s);
+      });
+      scan.lastLabel = saved.label || "";
+      if (/^all bazaars/.test(scan.lastLabel)) {
+        sortKey = "predicted";
+        sortDir = -1;
+      }
+      applyVerdicts();
+      return scan.subjects.length;
+    } finally {
+      restoring = false;
+    }
+  }
+  const PROGRESS_KEY = "scan_progress_v1";
+  const PROGRESS_TTL_MS = 15 * 60 * 1e3;
+  function markScanProgress(info) {
+    if (!info) return;
+    saveJSON(PROGRESS_KEY, Object.assign({
+      at: Date.now()
+    }, info));
+  }
+  function clearScanProgress() {
+    rawDelete(PROGRESS_KEY);
+  }
+  function readScanProgress() {
+    const p = loadJSON(PROGRESS_KEY, null);
+    if (!p || !p.at || Date.now() - p.at > PROGRESS_TTL_MS) return null;
+    return p;
+  }
+  function resumeInterruptedScan() {
+    const p = readScanProgress();
+    if (!p || scan.running) return;
+    if (p.kind === "item" && p.itemId) {
+      setStatus("Resuming the scan that the page change interrupted...", "progress");
+      setTimeout(function() {
+        runItemScan(p.itemId, {
+          resume: true
+        });
+      }, 2500);
+      return;
+    }
+    if (p.kind === "sweep") {
+      setStatus("Resuming the market sweep that the page change interrupted...", "progress");
+      setTimeout(function() {
+        runSweep({
+          resume: true
+        });
+      }, 2500);
+      return;
+    }
+    if (p.kind === "page") {
+      setStatus("Resuming the page scan that the page change interrupted...", "progress");
+      setTimeout(function() {
+        runScan(null, p.label || "this page", null, null, {
+          resume: true,
+          itemId: p.itemId || 0
+        });
+      }, 2500);
+    }
   }
   const auto = {
     timer: null,
@@ -1630,18 +1861,24 @@
     auto.timer = setTimeout(async function() {
       auto.timer = null;
       if (!settings.scan.auto.on) return;
-      const itemId = settings.scan.auto.itemId;
-      if (!itemId) {
-        stopAutoScan("No item selected for auto-scan.");
-        return;
-      }
       if (scan.running) {
         scheduleAutoScan(15e3);
         return;
       }
-      await runItemScan(itemId, {
-        background: true
-      });
+      if (settings.scan.auto.mode === "sweep") {
+        await runSweep({
+          background: true
+        });
+      } else {
+        const itemId = settings.scan.auto.itemId;
+        if (!itemId) {
+          stopAutoScan("No item selected for auto-scan.");
+          return;
+        }
+        await runItemScan(itemId, {
+          background: true
+        });
+      }
       if (settings.scan.auto.on) scheduleAutoScan(autoIntervalMs());
     }, Math.max(0, delayMs));
     paintAutoButton();
@@ -1652,12 +1889,21 @@
       setStatus("Pick an item first - auto-scan needs something to watch.", "warn");
       return;
     }
+    settings.scan.auto.mode = "item";
     settings.scan.auto.itemId = chosen;
     settings.scan.auto.on = true;
     settings.scan.lastItemId = chosen;
     saveSettings();
     scheduleAutoScan(0);
     setStatus("Auto-scan running for " + itemLabel(chosen) + ".", "ok");
+    paintAutoButton();
+  }
+  function startAutoSweep() {
+    settings.scan.auto.mode = "sweep";
+    settings.scan.auto.on = true;
+    saveSettings();
+    scheduleAutoScan(0);
+    setStatus("Auto-sweep running - each pass covers the next batch of bazaars.", "ok");
     paintAutoButton();
   }
   function stopAutoScan(reason) {
@@ -1679,16 +1925,29 @@
       if (scan.running) return;
       const left = Math.ceil((auto.nextAt - Date.now()) / 1e3);
       if (left > 0) {
-        setStatus("Auto-scan on " + itemLabel(settings.scan.auto.itemId) + " - next scan in " + left + "s.", "progress");
+        if (settings.scan.auto.mode === "sweep") {
+          setStatus("Auto-sweep - next pass in " + left + "s.", "progress");
+        } else {
+          setStatus("Auto-scan on " + itemLabel(settings.scan.auto.itemId) + " - next scan in " + left + "s.", "progress");
+        }
       }
     }, 1e3);
   }
   function paintAutoButton() {
     const btn = document.getElementById("tbms-auto-btn");
-    if (!btn) return;
-    btn.textContent = settings.scan.auto.on ? "Pause auto-scan" : "Auto-scan";
-    btn.classList.toggle("tbms-danger", !!settings.scan.auto.on);
-    btn.classList.toggle("tbms-primary", !settings.scan.auto.on);
+    const itemOn = !!settings.scan.auto.on && settings.scan.auto.mode !== "sweep";
+    if (btn) {
+      btn.textContent = itemOn ? "Pause auto-scan" : "Auto-scan";
+      btn.classList.toggle("tbms-danger", itemOn);
+      btn.classList.toggle("tbms-primary", !itemOn);
+    }
+    const sweep = document.getElementById("tbms-sweep-auto-btn");
+    if (sweep) {
+      const sweepOn = !!settings.scan.auto.on && settings.scan.auto.mode === "sweep";
+      sweep.textContent = sweepOn ? "Pause auto-sweep" : "Auto-sweep";
+      sweep.classList.toggle("tbms-danger", sweepOn);
+      sweep.classList.toggle("tbms-primary", !sweepOn);
+    }
   }
   const WATCH_KEY = "watch_v1";
   let watchlist = loadJSON(WATCH_KEY, {});
@@ -1700,6 +1959,7 @@
   }
   function watchSave() {
     saveJSON(WATCH_KEY, watchlist);
+    syncMark(WATCH_KEY);
   }
   function watchReadyEntries() {
     return watchEntries().filter(function(e) {
@@ -1991,9 +2251,18 @@
     scan.errorMessage = null;
     scan.skipped = 0;
     scan.lastLabel = sourceLabel || "this page";
-    if (!(opts && opts.append)) resetSubjects();
-    scan.results = [];
-    renderResults();
+    const appendMode = !!(opts && (opts.append || opts.resume));
+    const progressInfo = {
+      kind: opts && opts.kind || (pageItemId ? "item" : "page"),
+      itemId: pageItemId || 0,
+      label: scan.lastLabel
+    };
+    markScanProgress(progressInfo);
+    if (!appendMode) {
+      resetSubjects();
+      scan.results = [];
+      renderResults();
+    }
     setScanningUi(true);
     try {
       log((sourceLabel ? sourceLabel + " - checking " : "Checking ") + candidates.length + " new seller(s), cheapest source first.", "info");
@@ -2001,7 +2270,9 @@
       const ff = precomputedFf || await ffLookup(candidates);
       const pre = prefilterByStrength(candidates.map(function(id) {
         return {
-          id: id
+          id: id,
+          name: hints[id],
+          listing: listings[id] || null
         };
       }), ff);
       const targets = pre.keep.map(function(row) {
@@ -2045,7 +2316,7 @@
                 }
                 torn.__tbmsSelections = res.selections;
               }
-              addSubject(buildSubject(id, torn, ff[id], hints[id], listings[id], scannedItemId));
+              addSubject(buildSubject(id, torn, ff[id], hints[id], listings[id], listings[id] && listings[id].itemId || scannedItemId));
             } catch (e) {
               if (e.rateLimit) {
                 retries[id] = (retries[id] || 0) + 1;
@@ -2074,7 +2345,7 @@
               const stub = buildStubSubject(id, hints[id], why);
               if (listings[id]) {
                 stub.listing = listings[id];
-                stub.itemId = scannedItemId;
+                stub.itemId = listings[id].itemId || scannedItemId;
                 stub.listingSummary = summariseBazaar([ {
                   name: listings[id].itemName,
                   price: listings[id].price,
@@ -2092,6 +2363,8 @@
             } finally {
               if (consumed) {
                 done++;
+                markScanProgress(progressInfo);
+                schedulePersistResults();
                 setStatus("Fetched " + done + "/" + targets.length + " players...", "progress");
               }
             }
@@ -2146,6 +2419,7 @@
     } catch (e) {
       log("Scan failed: " + e.message, "error");
     } finally {
+      clearScanProgress();
       scan.running = false;
       setScanningUi(false);
       if (currentStatusKind === "progress" || currentStatusKind === "info") {
@@ -2156,7 +2430,7 @@
   function harvestIds() {
     const html = collectPageText();
     let ids = extractIdsFromHtml(html);
-    const self = extractIdsFromHtml(window.location.href);
+    const self = extractIdsFromHtml(pageHref());
     self.forEach(function(id) {
       if (ids.indexOf(id) === -1) ids.push(id);
     });
@@ -2224,7 +2498,7 @@
     "--tb-bg-sunken:#0c1115;--tb-line:#242f38;--tb-line-soft:#1b242b;",
     "--tb-text:#e3ebf2;--tb-text-dim:#94a3b0;--tb-text-faint:#63727e;",
     "--tb-ok:#4ade80;--tb-warn:#fbbf24;--tb-bad:#f87171;--tb-r:9px;}",
-    "#tbms-root{position:fixed;inset:0;pointer-events:none;z-index:2147483000;",
+    "#tbms-root{position:fixed;top:0;right:0;bottom:0;left:0;pointer-events:none;z-index:2147483000;",
     "font-family:ui-sans-serif,system-ui,-apple-system,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;",
     "font-size:13px;line-height:1.45;-webkit-font-smoothing:antialiased;color:var(--tb-text);}",
     "#tbms-root *{box-sizing:border-box;}",
@@ -2233,7 +2507,7 @@
     "#tbms-root ::-webkit-scrollbar-thumb{background:#2b3843;border-radius:6px;",
     "border:2px solid transparent;background-clip:content-box;}",
     "#tbms-root ::-webkit-scrollbar-thumb:hover{background:#3b4c59;background-clip:content-box;}",
-    "#tbms-fab{position:fixed;bottom:5px;right:8px;pointer-events:auto;cursor:pointer;",
+    "#tbms-fab{position:fixed;bottom:5px;right:8px;pointer-events:auto;cursor:pointer;touch-action:none;",
     "width:28px;height:28px;padding:0;border-radius:5px;border:1px solid #2c3a42;",
     "background:linear-gradient(#2f9fb4,#17606f);color:#eafcff;font-size:14px;",
     "line-height:1;display:flex;align-items:center;justify-content:center;",
@@ -2262,7 +2536,7 @@
     "#tbms-panel.tbms-hidden{display:none;}",
     "#tbms-head{display:flex;align-items:center;gap:10px;padding:9px 14px;",
     "background:var(--tb-bg-alt);border-bottom:1px solid var(--tb-line);cursor:move;",
-    "user-select:none;}",
+    "user-select:none;touch-action:none;}",
     "#tbms-head .tbms-title{font-weight:650;color:var(--tb-text);letter-spacing:-.01em;}",
     "#tbms-head .tbms-ver{color:var(--tb-text-faint);font-size:11px;}",
     "#tbms-head .tbms-spacer{flex:1;}",
@@ -2476,6 +2750,11 @@
       path: "filters.minBazaarValue",
       label: "Value on sale at least",
       hint: "What you would spend buying the item you searched for from this seller: their price x their quantity, in their bazaar or on the item market."
+    }, {
+      type: "toggleNumber",
+      path: "filters.maxSpend",
+      label: "Spend at most",
+      hint: "The cash you would hand over for this listing. Useful in a sweep to keep out items you cannot afford."
     }, {
       type: "select",
       path: "filters.vault",
@@ -2741,10 +3020,33 @@
     fab.style.right = "auto";
     fab.style.bottom = "auto";
   }
+
+  const USE_POINTER = typeof window !== "undefined" && typeof window.PointerEvent === "function";
+  let lastPointerAt = 0;
+  function onDragStart(targetEl, handler) {
+    if (USE_POINTER) {
+      targetEl.addEventListener("pointerdown", function(e) {
+        lastPointerAt = Date.now();
+        handler(e);
+      });
+    }
+    targetEl.addEventListener("mousedown", function(e) {
+      if (USE_POINTER && Date.now() - lastPointerAt < 1e3) return;
+      handler(e);
+    });
+  }
+  function onDragMove(handler) {
+    if (USE_POINTER) document.addEventListener("pointermove", handler);
+    document.addEventListener("mousemove", handler);
+  }
+  function onDragEnd(handler) {
+    if (USE_POINTER) document.addEventListener("pointerup", handler);
+    document.addEventListener("mouseup", handler);
+  }
   function makeDraggable(fab) {
     const SIZE = 28;
     let drag = null;
-    fab.addEventListener("mousedown", function(e) {
+    onDragStart(fab, function(e) {
       if (e.button !== 0) return;
       const rect = fab.getBoundingClientRect();
       drag = {
@@ -2756,7 +3058,7 @@
       };
       e.preventDefault();
     });
-    document.addEventListener("mousemove", function(e) {
+    onDragMove(function(e) {
       if (!drag) return;
       const dx = e.clientX - drag.x;
       const dy = e.clientY - drag.y;
@@ -2768,7 +3070,7 @@
       fab.style.right = "auto";
       fab.style.bottom = "auto";
     });
-    document.addEventListener("mouseup", function() {
+    onDragEnd(function() {
       if (!drag) return;
       const moved = drag.moved;
       drag = null;
@@ -2835,7 +3137,7 @@
   function makePanelDraggable() {
     const head = panel.querySelector("#tbms-head");
     let drag = null;
-    head.addEventListener("mousedown", function(e) {
+    onDragStart(head, function(e) {
       if (e.button !== 0) return;
       if (e.target.closest("button, a, input, select")) return;
       const rect = panel.getBoundingClientRect();
@@ -2848,7 +3150,7 @@
       head.style.cursor = "grabbing";
       e.preventDefault();
     });
-    document.addEventListener("mousemove", function(e) {
+    onDragMove(function(e) {
       if (!drag) return;
       const w = panel.offsetWidth;
       const h = panel.offsetHeight;
@@ -2858,7 +3160,7 @@
       panel.style.top = Math.round(top) + "px";
       e.preventDefault();
     });
-    document.addEventListener("mouseup", function() {
+    onDragEnd(function() {
       if (!drag) return;
       drag = null;
       head.style.cursor = "";
@@ -2874,11 +3176,11 @@
     const grip = el("div", {
       id: "tbms-grip",
       title: "Drag to resize",
-      style: "position:absolute;right:0;bottom:0;width:16px;height:16px;cursor:nwse-resize;" + "background:linear-gradient(135deg,transparent 45%,#4b5f6b 45%,#4b5f6b 58%,transparent 58%," + "transparent 70%,#4b5f6b 70%,#4b5f6b 83%,transparent 83%);z-index:5;"
+      style: "position:absolute;right:0;bottom:0;width:16px;height:16px;cursor:nwse-resize;touch-action:none;" + "background:linear-gradient(135deg,transparent 45%,#4b5f6b 45%,#4b5f6b 58%,transparent 58%," + "transparent 70%,#4b5f6b 70%,#4b5f6b 83%,transparent 83%);z-index:5;"
     });
     panel.appendChild(grip);
     let drag = null;
-    grip.addEventListener("mousedown", function(e) {
+    onDragStart(grip, function(e) {
       if (e.button !== 0) return;
       const rect = panel.getBoundingClientRect();
       drag = {
@@ -2890,13 +3192,13 @@
       e.preventDefault();
       e.stopPropagation();
     });
-    document.addEventListener("mousemove", function(e) {
+    onDragMove(function(e) {
       if (!drag) return;
       panel.style.width = Math.max(360, drag.w + (e.clientX - drag.x)) + "px";
       panel.style.height = Math.max(260, drag.h + (e.clientY - drag.y)) + "px";
       e.preventDefault();
     });
-    document.addEventListener("mouseup", function() {
+    onDragEnd(function() {
       if (!drag) return;
       drag = null;
       const rect = panel.getBoundingClientRect();
@@ -3016,13 +3318,15 @@
     if (settings.ui.open) positionPanel();
   }
   function setStatus(msg, kind) {
-    const foot = document.getElementById("tbms-foot");
+
+    const foot = typeof document !== "undefined" && document ? document.getElementById("tbms-foot") : null;
     if (!foot) return;
     foot.textContent = msg;
     foot.className = kind ? "tbms-" + kind : "";
     currentStatusKind = kind || "info";
   }
   function updateBadge(n) {
+    if (typeof document === "undefined" || !document) return;
     [ "tbms-badge", "tbms-footer-badge" ].forEach(function(id) {
       const b = document.getElementById(id);
       if (!b) return;
@@ -3033,9 +3337,11 @@
   function setScanningUi(running) {
     const scanBtn = document.getElementById("tbms-scan-btn");
     const itemBtn = document.getElementById("tbms-item-scan-btn");
+    const sweepBtn = document.getElementById("tbms-sweep-btn");
     const stopBtn = document.getElementById("tbms-stop-btn");
     if (scanBtn) scanBtn.disabled = running;
     if (itemBtn) itemBtn.disabled = running || !Object.keys(itemTable).length;
+    if (sweepBtn) sweepBtn.disabled = running;
     if (stopBtn) stopBtn.disabled = !running;
   }
   function renderScanTab() {
@@ -3049,7 +3355,7 @@
     const itemRow = el("div", {
       id: "tbms-item-row",
       class: "tbms-row",
-      style: "position:relative;"
+      style: "position:relative;flex-wrap:wrap;"
     });
     const itemInput = el("input", {
       class: "tbms-text",
@@ -3074,6 +3380,7 @@
       }
       hideItemSuggestions();
       settings.scan.lastItemId = id;
+      settings.scan.itemQuery = itemInput.value;
       saveSettings();
       runItemScan(id);
     });
@@ -3082,10 +3389,10 @@
       id: "tbms-auto-btn",
       class: "tbms-btn tbms-primary",
       text: "Auto-scan",
-      title: "Keep re-checking this item’s bazaar sellers in the background. The on/paused state is saved, so it survives a refresh."
+      title: "Keep re-checking this item's bazaar sellers in the background. The on/paused state is saved, so it survives a refresh."
     });
     autoBtn.addEventListener("click", async function() {
-      if (settings.scan.auto.on) {
+      if (settings.scan.auto.on && settings.scan.auto.mode !== "sweep") {
         stopAutoScan("Auto-scan paused. It stays paused after a refresh.");
         return;
       }
@@ -3093,6 +3400,17 @@
       startAutoScan(id);
     });
     itemRow.appendChild(autoBtn);
+    const stopBtn = el("button", {
+      id: "tbms-stop-btn",
+      class: "tbms-btn tbms-danger",
+      text: "Stop"
+    });
+    stopBtn.disabled = true;
+    stopBtn.addEventListener("click", function() {
+      scan.abort = true;
+      setStatus("Stopping after the current request...", "warn");
+    });
+    itemRow.appendChild(stopBtn);
     const suggestions = el("div", {
       id: "tbms-item-suggest",
       style: "display:none;position:absolute;top:100%;left:0;right:0;z-index:20;" + "max-height:190px;overflow:auto;background:#0d1216;border:1px solid #33434c;" + "border-radius:4px;box-shadow:0 8px 20px rgba(0,0,0,.6);"
@@ -3124,11 +3442,17 @@
     function choose(row) {
       itemInput.value = row.name;
       itemInput.setAttribute("data-item-id", String(row.id));
+      settings.scan.lastItemId = row.id;
+      settings.scan.itemQuery = row.name;
+      saveSettings();
       hideItemSuggestions();
       setStatus("Selected " + row.name + " (#" + row.id + "). Press the button to scan it.", "info");
     }
     function updateSuggestions() {
       const q = itemInput.value.trim().toLowerCase();
+
+      settings.scan.itemQuery = itemInput.value;
+      saveSettings();
       itemInput.removeAttribute("data-item-id");
       if (!q) {
         matches = [];
@@ -3168,15 +3492,78 @@
         hideItemSuggestions();
       }
     });
+    const savedQuery = String(settings.scan.itemQuery || "");
+    const savedId = toNumber(settings.scan.lastItemId);
     const detected = currentItemId();
-    if (detected) {
+    if (savedQuery) {
+      itemInput.value = savedQuery;
+      if (savedId) itemInput.setAttribute("data-item-id", String(savedId));
+    } else if (detected) {
       itemInput.value = String(detected);
+    }
+    if (detected) {
       s.appendChild(el("div", {
         class: "tbms-hint",
         style: "margin-bottom:6px;",
-        text: "This page is about item " + detected + " - press the button to scan it."
+        text: "This page is about item " + detected + (savedQuery ? " - your saved search is kept above." : " - press the button to scan it.")
       }));
     }
+    const sweepRow = el("div", {
+      class: "tbms-row",
+      style: "margin-top:6px;flex-wrap:wrap;"
+    });
+    const sweepBtn = el("button", {
+      id: "tbms-sweep-btn",
+      class: "tbms-btn tbms-primary",
+      text: "Sweep all bazaars",
+      title: "Walk the whole item catalog and rank every profitable listing by net profit, whatever the item."
+    });
+    sweepBtn.addEventListener("click", function() {
+      runSweep();
+    });
+    sweepRow.appendChild(sweepBtn);
+    const sweepAutoBtn = el("button", {
+      id: "tbms-sweep-auto-btn",
+      class: "tbms-btn",
+      text: "Auto-sweep",
+      title: "Keep walking the catalog, one rate-limited batch per pass, until every item with a bazaar has been seen."
+    });
+    sweepAutoBtn.addEventListener("click", function() {
+      if (settings.scan.auto.on && settings.scan.auto.mode === "sweep") {
+        stopAutoScan("Auto-sweep paused. It stays paused after a refresh.");
+        return;
+      }
+      startAutoSweep();
+    });
+    sweepRow.appendChild(sweepAutoBtn);
+    sweepRow.appendChild(el("label", {
+      class: "tbms-label",
+      text: "items per pass",
+      title: "How many item listing pages a sweep reads before it screens the sellers it found. The rest are left for the next pass."
+    }));
+    const perPassInput = el("input", {
+      id: "tbms-sweep-per-pass",
+      class: "tbms-num",
+      type: "number",
+      min: "1",
+      max: String(SWEEP_MAX_ITEMS_PER_PASS)
+    });
+    perPassInput.value = settings.scan.sweep.perPass;
+    perPassInput.addEventListener("change", function() {
+      const v = Math.round(Number(perPassInput.value));
+      const safe = isFinite(v) ? clamp(v, 1, SWEEP_MAX_ITEMS_PER_PASS) : 100;
+      settings.scan.sweep.perPass = safe;
+      perPassInput.value = safe;
+      saveSettings();
+      setStatus("Each sweep pass will read " + safe + " item(s).", "info");
+    });
+    sweepRow.appendChild(perPassInput);
+    s.appendChild(sweepRow);
+    s.appendChild(el("div", {
+      class: "tbms-hint",
+      style: "margin-bottom:6px;",
+      text: "Each pass reads the next batch of items with a bazaar (the 100 cheapest listings of each) and ranks them together by net profit. It carries on where it left off, so auto-sweep covers the whole market and then starts a fresh cycle."
+    }));
     const intervalRow = el("div", {
       class: "tbms-row"
     });
@@ -3198,7 +3585,7 @@
     });
     intervalRow.appendChild(el("label", {
       class: "tbms-label",
-      text: "Auto-scan every"
+      text: "Auto-scan / sweep every"
     }));
     intervalRow.appendChild(intervalInput);
     intervalRow.appendChild(el("span", {
@@ -3232,16 +3619,6 @@
       title: "A corner card with attack, bazaar and watch buttons for each match."
     }));
     s.appendChild(toastRow);
-    const stopBtn = el("button", {
-      id: "tbms-stop-btn",
-      class: "tbms-btn tbms-danger",
-      text: "Stop"
-    });
-    stopBtn.disabled = true;
-    stopBtn.addEventListener("click", function() {
-      scan.abort = true;
-      setStatus("Stopping after the current request...", "warn");
-    });
     const other = el("details", {
       class: "tbms-adv"
     });
@@ -3260,7 +3637,6 @@
       runScan();
     });
     row.appendChild(scanBtn);
-    row.appendChild(stopBtn);
     other.appendChild(row);
     const counter = el("span", {
       id: "tbms-harvest-count",
@@ -3303,6 +3679,8 @@
     manualRow.appendChild(manualBtn);
     other.appendChild(manualRow);
     s.appendChild(other);
+    paintAutoButton();
+    setScanningUi(scan.running);
     ensureItemTable().then(function(items) {
       if (Object.keys(items).length) {
         if (!itemInput.value && settings.scan.lastItemId) {
@@ -3375,14 +3753,24 @@
       return;
     }
     if (!settings.me.id) await learnOwnId();
+    if (!background && !(opts && opts.resume)) {
+      sortKey = "score";
+      sortDir = -1;
+    }
     scan.running = true;
     setScanningUi(true);
     setStatus("Looking up bazaar sellers...", "progress");
+    markScanProgress({
+      kind: "item",
+      itemId: itemId,
+      label: itemLabel(itemId)
+    });
     try {
       const found = await findBazaarSellers(itemId);
       if (!found.sellers.length) {
         scan.running = false;
         setScanningUi(false);
+        clearScanProgress();
         const base = "No bazaar sellers found for " + itemLabel(itemId) + ".";
         if (found.problems) {
           found.problems.forEach(function(p) {
@@ -3435,6 +3823,7 @@
       if (!screened.length) {
         scan.running = false;
         setScanningUi(false);
+        clearScanProgress();
         const breakdown = (found.detail || []).join(", ");
         setStatus("No sellers on " + itemLabel(itemId) + " - the sources returned nobody (" + breakdown + ").", "info");
         return;
@@ -3447,18 +3836,286 @@
       await runScan(screened.map(function(row) {
         return row.id;
       }), name + " (" + found.source + ")", hints, ff, {
-        append: background,
+        append: background || !!(opts && opts.resume),
         listings: listings,
         itemId: itemId
       });
+      clearScanProgress();
     } catch (e) {
       scan.running = false;
       setScanningUi(false);
+      clearScanProgress();
       if (background) {
         log("Auto-scan: " + e.message, "error");
       } else {
         setStatus("Item scan failed: " + e.message, "error");
       }
+    }
+  }
+  const sweepPageCache = {};
+  function readSweepState() {
+    const saved = loadJSON(SWEEP_STATE_KEY, null);
+    const seen = saved && Array.isArray(saved.seen) ? saved.seen.map(Number).filter(function(id) {
+      return isFinite(id) && id > 0;
+    }) : [];
+    return {
+      seen: seen,
+      cycles: saved && toNumber(saved.cycles) || 0,
+      at: saved && saved.at || 0
+    };
+  }
+  function saveSweepState(state) {
+    if (!state) return;
+    saveJSON(SWEEP_STATE_KEY, {
+      seen: state.seen || [],
+      cycles: state.cycles || 0,
+      at: Date.now()
+    });
+  }
+  function pruneSweepPageCache() {
+    const now = Date.now();
+    Object.keys(sweepPageCache).forEach(function(key) {
+      if (now - (sweepPageCache[key].at || 0) > SWEEP_PAGE_TTL_MS) delete sweepPageCache[key];
+    });
+  }
+  async function sweepItemPage(itemId) {
+    const hit = sweepPageCache[itemId];
+    if (hit && Date.now() - (hit.at || 0) < SWEEP_PAGE_TTL_MS) return hit;
+    const page = await weav3rListingPage(itemId);
+    const rec = Object.assign({
+      at: Date.now(),
+      itemId: itemId
+    }, page);
+    sweepPageCache[itemId] = rec;
+    if (Object.keys(sweepPageCache).length > 180) pruneSweepPageCache();
+    return rec;
+  }
+  function sweepListingNet(listing) {
+    const spend = (toNumber(listing.price) || 0) * (toNumber(listing.qty) || 0);
+    if (spend <= 0) return -Infinity;
+    return lootBreakdown({
+      listing: listing,
+      value: spend
+    }, settings.econ).net;
+  }
+  function sweepCatalog(index) {
+    const items = [];
+    (index && index.items || []).forEach(function(row) {
+      if (!row || !(row.item_id > 0)) return;
+      if (!(row.total_bazaars > 0)) return;
+      if (row.lowest_price === null || row.lowest_price === undefined) return;
+      if (!(row.lowest_price > 0) || !(row.market_price > 0)) return;
+      if (settings.filters.maxSpend.on && row.lowest_price > settings.filters.maxSpend.value) return;
+      items.push(row);
+    });
+    const mugBack = MUG_BASE_LIKELY * mugMultiplier(settings.econ) / 100;
+    const potential = function(row) {
+      const spread = Math.max(0, (row.market_price || 0) - (row.lowest_price || 0));
+      return (spread + (row.market_price || 0) * mugBack) * Math.max(1, row.total_bazaars || 1);
+    };
+    items.sort(function(a, b) {
+      return potential(b) - potential(a) || a.item_id - b.item_id;
+    });
+    return items;
+  }
+  function pruneSweepSubjects() {
+    if (scan.subjects.length <= SWEEP_RESULT_CAP) return;
+    scan.subjects.sort(function(a, b) {
+      return (toNumber(b.loot) || 0) - (toNumber(a.loot) || 0) || (toNumber(b.value) || 0) - (toNumber(a.value) || 0);
+    });
+    scan.subjects = scan.subjects.slice(0, SWEEP_RESULT_CAP);
+    scan.seenIds = {};
+    scan.subjects.forEach(function(subject) {
+      scan.seenIds[subject.id] = true;
+    });
+  }
+  async function runSweep(opts) {
+    const background = !!(opts && opts.background);
+    if (scan.running) return;
+    if (!settings.api.tornKey) {
+      setStatus("Add your Torn API key in Setup first.", "error");
+      switchTab("setup");
+      return;
+    }
+    if (!settings.scan.useWeav3r) {
+      setStatus("The market sweep reads the item catalog from weav3r. Turn it back on in Setup, or scan a specific item with Torn alone.", "warn");
+      return;
+    }
+    if (!settings.me.id) await learnOwnId();
+    scan.running = true;
+    scan.abort = false;
+    scan.errorMessage = null;
+    scan.emptyNote = null;
+    setScanningUi(true);
+    markScanProgress({
+      kind: "sweep",
+      label: "all bazaars"
+    });
+    let scanned = 0;
+    let listingCount = 0;
+    let skipped = 0;
+    let newCycle = false;
+    try {
+      setStatus("Reading every item with a bazaar...", "progress");
+      const index = await weav3rMarketIndex();
+      const catalog = sweepCatalog(index);
+      if (!catalog.length) {
+        setStatus("weav3r listed no items with bazaars to sweep.", "warn");
+        return;
+      }
+      const state = readSweepState();
+      const seen = {};
+      state.seen.forEach(function(id) {
+        seen[id] = true;
+      });
+      let pending = catalog.filter(function(row) {
+        return !seen[row.item_id];
+      });
+      if (!pending.length) {
+        newCycle = true;
+        state.seen = [];
+        state.cycles = (state.cycles || 0) + 1;
+        saveSweepState(state);
+        pending = catalog.slice();
+      }
+      const perPass = clamp(Math.round(toNumber(settings.scan.sweep.perPass) || 100), 1, SWEEP_MAX_ITEMS_PER_PASS);
+      const batch = pending.slice(0, perPass);
+      const left = Math.max(0, pending.length - batch.length);
+      const freshList = newCycle || !/^all bazaars/.test(scan.lastLabel || "");
+      log("Sweeping " + batch.length + " item(s)" + (left ? ", " + left + " left in this cycle" : " to finish this cycle") + ".", "info");
+      const best = {};
+      for (let i = 0; i < batch.length; i++) {
+        if (scan.abort) break;
+        const row = batch[i];
+        const name = row.item_name || itemTable[row.item_id] || "item #" + row.item_id;
+        setStatus("Sweeping " + (i + 1) + "/" + batch.length + ": " + name + " (" + listingCount + " listing(s) so far)", "progress");
+        let page = null;
+        let stoppedForRate = false;
+        for (let attempt = 0; attempt < 2 && !page; attempt++) {
+          try {
+            page = await sweepItemPage(row.item_id);
+          } catch (e) {
+            if (e.rateLimit) {
+              if (attempt === 0 && !scan.abort) {
+                setStatus("weav3r asked the sweep to slow down - pausing " + Math.round(SWEEP_BACKOFF_MS / 1e3) + "s...", "warn");
+                await sleep(SWEEP_BACKOFF_MS);
+                if (scan.abort) break;
+                continue;
+              }
+              stoppedForRate = true;
+              log("weav3r is still rate limiting - stopping this pass with the listings it already found.", "warn");
+              break;
+            }
+            const why = e && e.message || "unknown error";
+            log("Sweep skipped " + name + ": " + why, "warn");
+          }
+        }
+        if (scan.abort) break;
+        if (stoppedForRate) break;
+        if (!page) {
+          skipped++;
+          state.seen.push(row.item_id);
+          saveSweepState(state);
+        } else {
+          scanned++;
+          page.sellers.forEach(function(seller) {
+            const price = toNumber(seller.price);
+            const qty = toNumber(seller.qty);
+            if (price === null || qty === null || price <= 0 || qty <= 0) return;
+            const spend = price * qty;
+            if (settings.filters.minBazaarValue.on && spend < settings.filters.minBazaarValue.value) return;
+            if (settings.filters.maxSpend.on && spend > settings.filters.maxSpend.value) return;
+            const listing = {
+              id: seller.id,
+              name: seller.name || null,
+              itemId: row.item_id,
+              itemName: row.item_name || page.itemName || "item #" + row.item_id,
+              price: price,
+              qty: qty,
+              marketPrice: seller.marketPrice !== null && seller.marketPrice !== undefined ? seller.marketPrice : page.marketPrice !== null && page.marketPrice !== undefined ? page.marketPrice : row.market_price
+            };
+            listing.net = sweepListingNet(listing);
+            if (!isFinite(listing.net) || listing.net <= 0) return;
+            if (settings.filters.minLoot.on && listing.net < settings.filters.minLoot.value) return;
+            listingCount++;
+            const cur = best[listing.id];
+            if (!cur || listing.net > cur.net) best[listing.id] = listing;
+          });
+          state.seen.push(row.item_id);
+          saveSweepState(state);
+        }
+        if (i < batch.length - 1 && !scan.abort) await sleep(SWEEP_ITEM_DELAY_MS);
+      }
+      if (scan.abort) {
+        if (freshList) {
+          resetSubjects();
+          scan.results = [];
+          renderResults();
+          updateBadge(0);
+          dismissResultsToast();
+        }
+        setStatus("Sweep stopped after " + scanned + " item(s). What it found is saved; the next pass continues from there.", "warn");
+        return;
+      }
+      const ranked = Object.keys(best).map(function(id) {
+        return best[id];
+      }).sort(function(a, b) {
+        return b.net - a.net || b.qty * b.price - a.qty * a.price;
+      });
+      if (!ranked.length) {
+        if (freshList) {
+          resetSubjects();
+          scan.results = [];
+          scan.lastLabel = "";
+          updateBadge(0);
+          dismissResultsToast();
+        }
+        scan.emptyNote = "The sweep checked " + scanned + " item(s) but found no listing that estimates a profit. " + (skipped ? skipped + " item(s) could not be read." : "");
+        renderResults();
+        setStatus("Swept " + scanned + " item(s) - no profitable listings in this batch.", "warn");
+        return;
+      }
+      const cap = Math.max(1, toNumber(settings.scan.maxCandidates) || 300);
+      const top = ranked.slice(0, cap);
+      const listings = {};
+      const hints = {};
+      const ids = [];
+      top.forEach(function(listing) {
+        listings[listing.id] = listing;
+        if (listing.name) hints[listing.id] = listing.name;
+        if (!isSelf(listing.id)) ids.push(listing.id);
+      });
+      if (!ids.length) {
+        setStatus("The sweep only found your own listings.", "info");
+        return;
+      }
+      const label = "all bazaars (" + scanned + " item" + (scanned === 1 ? "" : "s") + ")";
+      log(scanned + " item(s) swept: " + listingCount + " profitable listing(s), " + ranked.length + " seller(s)." + (skipped ? " " + skipped + " item(s) could not be read." : ""), "ok");
+      if (!freshList) pruneSweepSubjects();
+      sortKey = "predicted";
+      sortDir = -1;
+      scan.running = false;
+      await runScan(ids, label, hints, null, {
+        append: !freshList,
+        listings: listings,
+        itemId: 0,
+        kind: "sweep",
+        sweep: true
+      });
+      if (!scan.errorMessage && !scan.abort) {
+        setStatus("Sweep pass done: " + scanned + " item(s), " + listingCount + " profitable listing(s), " + ranked.length + " seller(s) checked.", "ok");
+      }
+    } catch (e) {
+      if (e && e.rateLimit) {
+        log("The market sweep stopped because weav3r is rate limiting. Try again in a minute - the items already swept are not repeated.", "warn");
+      } else {
+        log("Market sweep failed: " + (e && e.message || "unknown error"), "error");
+      }
+    } finally {
+      clearScanProgress();
+      scan.running = false;
+      setScanningUi(false);
+      if (!scan.abort && currentStatusKind === "progress") setStatus("Ready.", "info");
     }
   }
   function renderFiltersTab() {
@@ -3516,6 +4173,7 @@
     s.appendChild(rescan);
   }
   function toastHostEl() {
+    if (typeof document === "undefined" || !document || !document.body) return null;
     const existing = document.getElementById("tbms-toasts");
     if (existing) return existing;
     const host = el("div", {
@@ -3525,6 +4183,7 @@
     return host;
   }
   function dismissResultsToast() {
+    if (typeof document === "undefined" || !document) return;
     const old = document.getElementById("tbms-results-toast");
     if (old) old.remove();
   }
@@ -3599,7 +4258,9 @@
         class: "tbms-toast-name",
         text: su.name
       }));
-      const bits = [ String(m.verdict.score) ];
+      const bits = [];
+      if (su.listing) bits.push(su.listing.itemName);
+      bits.push(String(m.verdict.score));
       if (su.ff && su.ff.fairFight !== null) bits.push("FF " + su.ff.fairFight.toFixed(2));
       bits.push(formatMoney(su.loot || 0) + " loot");
       who.appendChild(el("span", {
@@ -3607,7 +4268,7 @@
         text: bits.join(" · ")
       }));
       row.appendChild(who);
-      row.appendChild(toastAction("attack", "https://www.torn.com/loader.php?sid=attack&user2ID=" + su.id, null, "tbms-toast-attack"));
+      row.appendChild(toastAction("attack", "https://www.torn.com/page.php?sid=attack&user2ID=" + su.id, null, "tbms-toast-attack"));
       row.appendChild(toastAction("bazaar", "https://www.torn.com/bazaar.php?userId=" + su.id, null));
       row.appendChild(toastAction("watch", null, function() {
         watchAdd(su.id, su.name, su.status, "added from the results card");
@@ -3636,7 +4297,8 @@
       switchTab("results");
     }));
     card.appendChild(foot);
-    toastHostEl().appendChild(card);
+    const host = toastHostEl();
+    if (host) host.appendChild(card);
   }
   let toastSignature = "";
   function renderWatchTab() {
@@ -3793,7 +4455,7 @@
       if (e.ready) {
         actTd.appendChild(el("a", {
           class: "tbms-link",
-          href: "https://www.torn.com/loader.php?sid=attack&user2ID=" + e.id,
+          href: "https://www.torn.com/page.php?sid=attack&user2ID=" + e.id,
           target: "_blank",
           rel: "noopener",
           text: "attack"
@@ -3843,7 +4505,7 @@
     if (!scan.results.length) {
       s.appendChild(el("div", {
         class: "tbms-empty",
-        text: scan.running ? "Scanning..." : scan.emptyNote || "No results yet. Pick an item on the Scan tab."
+        text: scan.running ? "Scanning..." : scan.emptyNote || "No results yet. Pick an item, or sweep all bazaars on the Scan tab."
       }));
       return;
     }
@@ -3910,6 +4572,7 @@
       if (persistTimer) clearTimeout(persistTimer);
       persistTimer = null;
       rawDelete(RESULTS_KEY);
+      clearScanProgress();
       resetSubjects();
       scan.results = [];
       scan.emptyNote = null;
@@ -3917,6 +4580,7 @@
       dismissResultsToast();
       updateBadge(0);
       renderResults();
+      syncMark(RESULTS_KEY);
       setStatus("Results cleared. Your watchlist is untouched.", "info");
     });
     top.appendChild(clearBtn);
@@ -3929,7 +4593,7 @@
     });
     const thead = el("thead");
     const htr = el("tr");
-    [ [ "score", "Score", "46px" ], [ "name", "Seller", "132px" ], [ "status", "Where", "104px" ], [ "strength", "FF / stats", "74px" ], [ "loot", "On sale", "132px" ], [ "predicted", "Net profit", "92px" ], [ "why", "Notes", "auto" ], [ "act", "", "118px" ] ].forEach(function(pair) {
+    [ [ "score", "Score", "40px" ], [ "name", "Seller", "112px" ], [ "item", "Item", "112px" ], [ "status", "Where", "92px" ], [ "strength", "FF / stats", "68px" ], [ "loot", "On sale", "118px" ], [ "predicted", "Net profit", "88px" ], [ "why", "Notes", "auto" ], [ "act", "", "104px" ] ].forEach(function(pair) {
       const th = el("th", {
         text: pair[1]
       });
@@ -3960,6 +4624,9 @@
         switch (sortKey) {
          case "name":
           return su.name.toLowerCase();
+
+         case "item":
+          return String(su.listing && su.listing.itemName || su.itemId && itemTable[su.itemId] || "").toLowerCase();
 
          case "status":
           return su.status.state;
@@ -4020,6 +4687,33 @@
       text: "#" + su.id + (su.level ? " · lvl " + su.level : "")
     }));
     tr.appendChild(nameTd);
+    const itemTd = el("td");
+    if (su.listing) {
+      itemTd.appendChild(el("span", {
+        text: su.listing.itemName || "item",
+        title: (su.listing.itemName || "item") + " - " + su.listing.qty + " at " + formatMoney(su.listing.price)
+      }));
+      itemTd.appendChild(document.createElement("br"));
+      itemTd.appendChild(el("span", {
+        class: "tbms-hint",
+        text: su.listing.marketPrice ? "market " + formatMoney(su.listing.marketPrice) : su.listing.itemId ? "#" + su.listing.itemId : "listing"
+      }));
+    } else if (su.itemId) {
+      itemTd.appendChild(el("span", {
+        text: itemTable[su.itemId] || "item #" + su.itemId
+      }));
+      itemTd.appendChild(document.createElement("br"));
+      itemTd.appendChild(el("span", {
+        class: "tbms-hint",
+        text: "whole bazaar"
+      }));
+    } else {
+      itemTd.appendChild(el("span", {
+        class: "tbms-hint",
+        text: "whole bazaar"
+      }));
+    }
+    tr.appendChild(itemTd);
     const stateTd = el("td");
     const cls = su.status.available ? "tbms-ok" : su.status.inTorn ? "tbms-warn" : "tbms-bad";
     stateTd.appendChild(el("span", {
@@ -4165,7 +4859,7 @@
     actTd.appendChild(document.createTextNode(" · "));
     actTd.appendChild(el("a", {
       class: "tbms-link",
-      href: "https://www.torn.com/loader.php?sid=attack&user2ID=" + su.id,
+      href: "https://www.torn.com/page.php?sid=attack&user2ID=" + su.id,
       target: "_blank",
       rel: "noopener",
       text: "attack"
@@ -4236,6 +4930,12 @@
     return head + "\n" + body;
   }
   function copyToClipboard(text) {
+    try {
+      if (typeof GM_setClipboard === "function") {
+        GM_setClipboard(text);
+        return;
+      }
+    } catch (e) {}
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text);
@@ -4438,7 +5138,7 @@
     keySec.appendChild(el("div", {
       class: "tbms-hint",
       style: "margin:6px 0;border-left:2px solid #2f97a8;padding-left:8px;",
-      text: 'Use a LIMITED key. Torn has four levels - Public, Minimal, Limited, Full - and this script has to read other players’ bazaars, property and battle stats, which Public and Minimal are not allowed to do. Full works too. If a selection is out of reach Torn answers "access level of this key is not high enough", and the test below will tell you exactly which ones are blocked.'
+      text: "Use a LIMITED key. Torn has four levels - Public, Minimal, Limited, Full - and this script has to read other players' bazaars, property and battle stats, which Public and Minimal are not allowed to do. Full works too. If a selection is out of reach Torn answers 'access level of this key is not high enough', and the test below will tell you exactly which ones are blocked."
     }));
     const keyInput = makeKeyField("tbms-torn-key", "your 16-character Torn API key");
     keyInput.value = settings.api.tornKey || "";
@@ -4559,7 +5259,7 @@
             return !r.ok && (r.code === ERR_KEY_LEVEL || r.code === ERR_ACCESS);
           }).length;
           if (blocked) {
-            setStatus(blocked + " selection(s) are above this key’s level - raise it to Limited. See the report below.", "warn");
+            setStatus(blocked + " selection(s) are above this key's level - raise it to Limited. See the report below.", "warn");
           }
         } catch (e) {
           log("Key probe failed: " + e.message, "warn");
@@ -4673,6 +5373,39 @@
     bsManual.appendChild(bsInput);
     meSec.appendChild(bsManual);
     s.appendChild(meSec);
+
+    const geomSec = el("div", {
+      class: "tbms-sec"
+    });
+    geomSec.appendChild(el("h4", {
+      text: "Panel & opener"
+    }));
+    const geomRow = el("div", {
+      class: "tbms-row"
+    });
+    const geomBtn = el("button", {
+      id: "tbms-reset-geom",
+      class: "tbms-btn",
+      text: "Reset position & size",
+      title: "Put the opener back in the footer and the panel back to its default spot and size."
+    });
+    geomBtn.addEventListener("click", function() {
+      settings.ui.fabPos = null;
+      settings.ui.panelPos = null;
+      settings.ui.panelSize = null;
+      saveSettings();
+      applyFabPos();
+      applyPanelGeom();
+      positionPanel();
+      setStatus("Opener and panel reset to their default spot and size.", "ok");
+    });
+    geomRow.appendChild(geomBtn);
+    geomSec.appendChild(geomRow);
+    geomSec.appendChild(el("div", {
+      class: "tbms-hint",
+      text: "You are never listed as one of your own targets - player " + AUTHOR_ID + " is always excluded."
+    }));
+    s.appendChild(geomSec);
     const advSec = el("details", {
       class: "tbms-adv"
     });
@@ -4804,7 +5537,7 @@
     }));
     srcSec.appendChild(el("div", {
       class: "tbms-hint",
-      text: "Torn’s own API is always tried first. It is authoritative and live, and needs no extra service."
+      text: "Torn's own API is always tried first. It is authoritative and live, and needs no extra service."
     }));
     const wRow = el("div", {
       class: "tbms-row"
@@ -4914,10 +5647,11 @@
   function watchNavigation() {
     window.addEventListener("hashchange", scheduleHarvest);
     window.addEventListener("popstate", scheduleHarvest);
-    let last = location.href;
+    let last = pageHref();
     setInterval(function() {
-      if (location.href !== last) {
-        last = location.href;
+      const now = pageHref();
+      if (now !== last) {
+        last = now;
         scheduleHarvest();
       }
     }, 1500);
@@ -4934,12 +5668,15 @@
     startAutoTicker();
     startWatchTicker();
     paintWatchTab();
+    startSyncWatcher();
     cachePrune();
     const restored = restoreResults();
     log(restored ? "Buy-Mug Scout ready - restored " + restored + " result(s) from the last scan." : "Buy-Mug Scout v" + VERSION + " ready.", "info");
-    if (settings.scan.auto.on && settings.scan.auto.itemId) {
-      setStatus("Resuming auto-scan after page load...", "progress");
+    if (settings.scan.auto.on && (settings.scan.auto.mode === "sweep" || settings.scan.auto.itemId)) {
+      setStatus(settings.scan.auto.mode === "sweep" ? "Resuming auto-sweep after page load..." : "Resuming auto-scan after page load...", "progress");
       scheduleAutoScan(3e3);
+    } else {
+      resumeInterruptedScan();
     }
     if (!settings.api.tornKey) {
       settings.ui.open = true;
@@ -4997,11 +5734,43 @@
       toCsv: toCsv
     };
   }
-  if (typeof document !== "undefined" && document.body) {
+  function whenBodyReady(fn) {
+    const started = function() {
+      if (!document.body) return false;
+      fn();
+      return true;
+    };
+    if (started()) return;
+    if (typeof MutationObserver === "function" && document.documentElement) {
+      let done = false;
+      const obs = new MutationObserver(check);
+      function check() {
+        if (done) return;
+        if (!started()) return;
+        done = true;
+        obs.disconnect();
+        document.removeEventListener("DOMContentLoaded", check);
+      }
+      obs.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+      });
+      document.addEventListener("DOMContentLoaded", check);
+      return;
+    }
+    const iv = setInterval(function() {
+      if (started()) clearInterval(iv);
+    }, 30);
+  }
+  function boot() {
+    if (typeof document === "undefined") return;
     if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", init);
+      document.addEventListener("DOMContentLoaded", function() {
+        whenBodyReady(init);
+      }, { once: true });
     } else {
-      init();
+      whenBodyReady(init);
     }
   }
+  boot();
 })();

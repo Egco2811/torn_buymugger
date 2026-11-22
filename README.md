@@ -22,6 +22,20 @@ and lays it out. You keep the trigger.
    * paste the file's contents into a new script.
 3. Save. Loading `torn.com` will now mount the scout.
 
+**Torn PDA:** install it the same way from Torn PDA's own *Scripts* screen.
+Torn PDA exposes the same `GM_*` functions the script uses (storage,
+requests, styles) but it injects every script a little earlier in the page's
+life than a desktop manager does, and it has no userscript menu. The script
+waits for the document body before it mounts rather than assuming it is
+already there. Torn PDA also rewrites curly quotes in a script's source to
+straight ones before running it, which used to turn an apostrophe inside a
+quoted string into a syntax error and stop the whole script loading - the
+source is now plain ASCII, so nothing it can rewrite changes. Beyond that it
+drives its drags with touch/pointer events, copies through `GM_setClipboard`,
+and puts the menu's "reset the panel" action on a button in **Setup**. The
+opener falls back to a corner button when Torn's own footer icons are
+missing, which is the usual case on PDA.
+
 ## First run
 
 The panel opens on the **Setup** tab automatically.
@@ -57,7 +71,7 @@ The panel opens on the **Setup** tab automatically.
 
 ## Using it
 
-Type an item name (or id) into the Scan tab and press **Scan item bazaars**.
+Type an item name (or id) into the Scan tab and press **Scan bazaars**.
 The seller list comes from bazaar *data*, not from anything rendered on
 screen, so it works from any Torn page. The script then:
 
@@ -71,6 +85,36 @@ not serve it, so the picker works even before your key is set up right. It
 is cached for a week, and a raw item id always works with no index at all.
 Sellers are ordered by the value of the listing the script found them
 through, so when the per-scan cap bites you get the biggest stocks first.
+
+### Sweep every bazaar
+
+**Sweep all bazaars** is the item-by-item search turned around: instead of
+naming one item, it walks the whole catalog and ranks what it finds together.
+
+1. It reads the item index from weav3r.dev and keeps everything with a bazaar.
+2. It reads one listing page per item - the 100 cheapest listings, which is
+   the page size weav3r allows - pausing between calls to stay under its
+   100-request-per-minute limit. If weav3r asks it to slow down it backs off
+   for 45 seconds and tries that item again.
+3. It values every listing with the same mug maths as an item scan, keeps the
+   best listing for each seller, and passes the top sellers through FFScouter
+   and Torn exactly as a normal scan would.
+
+The results table has an **Item** column and opens sorted by **Net profit**,
+so the biggest opportunity floats to the top regardless of which item it came
+from. A seller who lists several things appears once, through their best
+listing. **Auto-sweep** repeats the passes in the background; each pass carries
+on where the last one stopped, so between them they cover every item with a
+bazaar, then start a fresh cycle. **items per pass** (default 100, maximum 200)
+is the knob for how long a single pass runs.
+
+The sweep needs the weav3r scanner switched on in **Setup**. It does not spend
+your Torn item-market budget - Torn is only asked about the sellers that
+survive the strength screen. Because the scanner returns one page per item,
+the sweep is a broad look at the cheapest listings on the market rather than
+every listing in every bazaar; that page contains the discounts, and the
+filters still decide what is worth acting on. The specific-item search is
+unchanged.
 
 ### Auto-scan
 
@@ -108,6 +152,28 @@ going to the market and coming back still shows your shortlist - it is even
 announced in the status bar. Stored results are **re-scored on the way back
 in**, so what you see always reflects the filters you have now rather than
 the ones that were set when the scan ran.
+
+The **item you were searching for** is saved the same way, on every
+keystroke. Come back on any page and the box still holds what you left in
+it, and the shortlist matches it - moving around never leaves one page with
+results and another with an empty panel. If the page you land on happens to
+be about a *different* item, that is only mentioned in a hint; your own
+search is not overwritten by it.
+
+### More than one tab open
+
+Tabs share their state live. Scan in one and the shortlist appears in the
+others; press **Clear** in one and the rest empty too, and the watchlist and
+filters follow along. Each tab watches the shared store it already writes to
+and re-reads it when another tab changes it, so the pages can never disagree
+about what was found.
+
+If a tab is refreshed (or a Torn tab change reloads it) while a scan is still
+running, the scan is remembered and **picks up where it left off** when the
+page comes back, rather than being lost. The players already looked up come
+straight from the cache, so the resumed pass only spends requests on the ones
+that were left. Pressing **Stop** clears that memory, so a stopped scan stays
+stopped.
 
 Only the totals are kept, not the raw API payloads or the item lists, which
 works out at well under a kilobyte per seller. The store is capped at 200
@@ -330,7 +396,7 @@ couple of waits it stops and tells you which knob to turn.
 ## The filters
 
 Every filter is a switch plus a value, so you can enable, disable and
-retune any of them without editing code. Seven of them cover the decision:
+retune any of them without editing code. The main ones cover the decision:
 
 **Where they are** - in Torn and not abroad, not hospitalised or jailed,
 a maximum time since their last action, plus two "soon" exceptions:
@@ -340,9 +406,10 @@ they are nearly back, which is exactly who you want to be waiting for.
 Their row shows the countdown ("lands in 4m", "out in 3m") and they score
 slightly below someone standing there right now.
 
-**What they are carrying** - a minimum bazaar buy-out value, and the
-property vault setting with three positions: ignore, skip vault owners, or
-only vault owners. Plus **Predicted loot at least**.
+**What they are carrying** - a minimum bazaar buy-out value, a maximum
+spend (handy in a sweep, so the biggest-money rows do not bury listings you
+cannot afford), and the property vault setting with three positions: ignore,
+skip vault owners, or only vault owners. Plus **Predicted loot at least**.
 
 ### What is on sale
 
@@ -453,6 +520,9 @@ Two notes on how this behaves honestly rather than conveniently:
 **You are never scouted yourself.** Your own id is dropped from the page
 list, and if the script does not know your id yet it looks it up first,
 because your own bazaar page links it and mugging yourself is not a plan.
+The author's own profile (**Egco [2598210]**) is also hardcoded as
+off-limits, so you cannot appear in your own results even on a brand-new
+install, before any key has been read.
 
 ## Reading the results
 

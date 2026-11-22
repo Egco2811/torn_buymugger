@@ -1,15 +1,3 @@
-/* End-to-end smoke test for the in-page UI.
- *
- * Loads the userscript into a real DOM (jsdom) with Torn-shaped markup,
- * stubs GM_xmlhttpRequest with canned Torn + FFScouter responses that
- * mirror the documented schemas, then drives an actual scan through the
- * buttons. This catches the breakage that pure unit tests cannot see:
- * wiring, element ids, render paths.
- *
- * Needs jsdom:  npm install --no-save jsdom
- * Skipped automatically when jsdom is not installed.
- */
-
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
@@ -29,7 +17,6 @@ const SOURCE = fs.readFileSync(
 
 const NOW = Math.floor(Date.now() / 1000);
 
-/* --- a bazaar page with three sellers linked the way Torn links them -- */
 const PAGE_HTML = `<!doctype html><html><body>
   <div id="topHeader"></div>
   <div class="bazaar-list">
@@ -45,7 +32,6 @@ const PAGE_HTML = `<!doctype html><html><body>
   </ul></div>
 </body></html>`;
 
-/* --- canned API responses -------------------------------------------- */
 function tornUser(id, over) {
   const base = {
     profile: {
@@ -64,7 +50,7 @@ function tornUser(id, over) {
 }
 
 const RESPONSES = {
-  // A comfortable target: low FF, modest stock, available, no vault.
+
   1111111: tornUser(1111111, {
     profile: {
       name: 'Alice',
@@ -74,7 +60,7 @@ const RESPONSES = {
     },
     bazaar: [{ name: 'Xanax', quantity: 30, price: 800000, market_price: 900000 }]
   }),
-  // Abroad: must be filtered out by the location rule.
+
   2222222: tornUser(2222222, {
     profile: {
       name: 'Bob',
@@ -83,7 +69,7 @@ const RESPONSES = {
       status: { state: 'Abroad', description: 'Travelling to the Cayman Islands' }
     }
   }),
-  // Hits like a truck: must be filtered out by the stat rules.
+
   3333333: tornUser(3333333, {
     profile: {
       name: 'Carol',
@@ -100,7 +86,6 @@ const FF_STATS = [
   { player_id: 3333333, fair_fight: 12.0, bs_estimate: 900000000, bs_estimate_human: '900m', bss_public: 120000, last_updated: NOW, source: 'bss' }
 ];
 
-/* Torn's item index, which the picker resolves names against. */
 const ITEMS = {
   '206': { name: 'Xanax' },
   '366': { name: 'Donator Pack' },
@@ -129,27 +114,8 @@ const SEED_SETTINGS = {
   ui: { open: true, tab: 'scan', onlyMatches: false, fabPos: null }
 };
 
-function boot(seedSettings, extraKeys) {
-  const dom = new JSDOM(PAGE_HTML, {
-    url: 'https://www.torn.com/bazaar.php',
-    runScripts: 'outside-only',
-    pretendToBeVisual: true
-  });
-  const win = dom.window;
-
-  const store = new Map();
-  if (seedSettings !== null) {
-    store.set('settings', JSON.stringify(seedSettings || SEED_SETTINGS));
-  }
-  // Anything else that should already exist at startup (watchlist, cache).
-  Object.keys(extraKeys || {}).forEach((k) => store.set(k, extraKeys[k]));
-  const calls = [];
-
-  win.GM_getValue = (k, def) => (store.has(k) ? store.get(k) : def);
-  win.GM_setValue = (k, v) => store.set(k, v);
-  win.GM_addStyle = () => {};
-  win.GM_registerMenuCommand = () => {};
-  win.GM_xmlhttpRequest = function (opts) {
+function makeRequestStub(calls) {
+  return function (opts) {
     calls.push(opts.url);
     let body = null;
     let status = 200;
@@ -189,17 +155,73 @@ function boot(seedSettings, extraKeys) {
       status = 404;
       body = '{}';
     }
-    // Respond on the next tick so the script's promise plumbing is exercised.
+
     setTimeout(() => opts.onload({ status, responseText: body }), 0);
   };
+}
 
-  win.eval(SOURCE);
-  // jsdom still reports readyState "loading" at this point, so the script
-  // waits for DOMContentLoaded exactly as it would on a fresh Torn load.
-  if (!win.document.getElementById('tbms-root')) {
+function bootIn(html, url, seedSettings, extraKeys, options) {
+  const opts = options || {};
+  const dom = new JSDOM(html, {
+    url: url || 'https://www.torn.com/bazaar.php',
+    runScripts: 'outside-only'
+  });
+  const win = dom.window;
+
+  win.close = NEUTER_CLOSE;
+
+  const store = opts.store || new Map();
+  if (seedSettings !== null) {
+    store.set('settings', JSON.stringify(seedSettings || SEED_SETTINGS));
+  }
+
+  Object.keys(extraKeys || {}).forEach((k) => store.set(k, extraKeys[k]));
+  const calls = [];
+
+  win.GM_getValue = (k, def) => (store.has(k) ? store.get(k) : def);
+  win.GM_setValue = (k, v) => store.set(k, v);
+  win.GM_addStyle = () => {};
+  if (!opts.pda) {
+
+    win.GM_registerMenuCommand = () => {};
+  }
+  win.GM_xmlhttpRequest = makeRequestStub(calls);
+
+  if (opts.pda) {
+
+    const body = win.document.body;
+    win.document.documentElement.removeChild(body);
+    const wrapped =
+      '(function(){const PDA_storage={get:async()=>null,getMany:async()=>({}),' +
+      'loadAll:async()=>({}),list:async()=>[],set:async()=>{},setMany:async()=>{},' +
+      'delete:async()=>{},usage:async()=>({used:0,quota:0})};' +
+      SOURCE +
+      '}());';
+
+    win.eval(wrapped.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'"));
+
+    win.document.documentElement.appendChild(body);
     win.document.dispatchEvent(new win.Event('DOMContentLoaded', { bubbles: true }));
+  } else {
+    win.eval(SOURCE);
+
+    if (!win.document.getElementById('tbms-root')) {
+      win.document.dispatchEvent(new win.Event('DOMContentLoaded', { bubbles: true }));
+    }
   }
   return { dom, win, store, calls };
+}
+
+function boot(seedSettings, extraKeys, url) {
+  return bootIn(PAGE_HTML, url, seedSettings, extraKeys);
+}
+
+function bootPDA(seedSettings, extraKeys, url) {
+  return bootIn(PAGE_HTML, url, seedSettings, extraKeys, { pda: true });
+}
+
+function bootWithHtml(html, seedSettings, extraKeys, url) {
+  return bootIn(html, url, seedSettings, extraKeys);
 }
 
 function waitFor(fn, timeoutMs = 5000, label = 'condition') {
@@ -221,18 +243,11 @@ function waitFor(fn, timeoutMs = 5000, label = 'condition') {
   });
 }
 
-/**
- * jsdom does no layout, so give the panel a box that actually reflects the
- * inline geometry the drag/resize handlers write - otherwise reading the
- * rect back at mouseup would always return the starting values.
- */
-/**
- * Result rows only. The Watch tab draws a table with the same classes, so an
- * unscoped query would silently count both.
- */
 function resultRows(doc) {
   return doc.querySelectorAll('section[data-tab="results"] table.tbms-table tbody tr');
 }
+
+function NEUTER_CLOSE() {}
 
 function stubLayout(panel, base) {
   const start = Object.assign({ left: 400, top: 100, width: 700, height: 500 }, base || {});
@@ -260,7 +275,7 @@ t('mounts the floating button and panel into the page', () => {
 });
 
 t('panel starts open on first run when no key is stored', () => {
-  // null seed == a brand new install with nothing saved.
+
   const { dom, win } = boot(null);
 
   const panel = win.document.getElementById('tbms-panel');
@@ -308,12 +323,9 @@ t('a full scan finds the one good target and rejects the rest', async () => {
   assert.ok(byName.Bob.classList.contains('tbms-reject'), 'Bob is rejected (abroad)');
   assert.ok(byName.Carol.classList.contains('tbms-reject'), 'Carol is rejected (too strong)');
 
-  // The rejection reasons must be legible in the table, not just implied.
   assert.match(byName.Bob.textContent, /abroad/i);
   assert.match(byName.Carol.textContent, /fair fight|stats/i, 'the screen states its reason');
 
-  // One batched FFScouter call. Torn is only spent on the survivors of the
-  // strength screen, so Carol (FF 9.4 / 680m) never costs a request.
   const ffCalls = calls.filter((u) => u.includes('ffscouter'));
   const tornCalls = calls.filter((u) => u.includes('api.torn.com/user/'));
   assert.equal(ffCalls.length, 1, 'FFScouter is batched into a single request');
@@ -322,7 +334,7 @@ t('a full scan finds the one good target and rejects the rest', async () => {
     !tornCalls.some((u) => /user\/3333333\?/.test(u)),
     'the too-strong seller never reached Torn'
   );
-  // …but she is still shown, with the reason, rather than vanishing.
+
   assert.ok(byName.Carol, 'screened-out sellers still get a row');
   assert.match(byName.Carol.textContent, /screened out/i, 'labelled as screened out');
 
@@ -342,7 +354,6 @@ t('re-scores instantly from cache when filters change', async () => {
 
   const callsAfterScan = calls.length;
 
-  // Relax every gate, then re-score without hitting the network.
   const filtersTab = doc.querySelector('.tbms-tab[data-tab="filters"]');
   filtersTab.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
 
@@ -369,8 +380,6 @@ t('re-scores instantly from cache when filters change', async () => {
     'the checked sellers to become matches'
   );
 
-  // The screened-out seller stays rejected and must NOT be re-imagined as a
-  // player with an empty bazaar; she needs a scan to be judged at all.
   const carol = Array.from(resultRows(doc)).find((tr) =>
     /Carol/.test(tr.textContent)
   );
@@ -407,7 +416,6 @@ t('survives an invalid key without crashing the page', async () => {
   const { dom, win } = boot();
   const doc = win.document;
 
-  // Every Torn lookups now fails the way Torn does for a bad key.
   win.GM_xmlhttpRequest = function (opts) {
     setTimeout(
       () =>
@@ -433,7 +441,7 @@ t('survives an invalid key without crashing the page', async () => {
 });
 
 t('the setup button stores your key and loads your own stats', async () => {
-  const { dom, win, store } = boot(null); // brand new install
+  const { dom, win, store } = boot(null);
   const doc = win.document;
 
   const keyInput = doc.getElementById('tbms-torn-key');
@@ -457,7 +465,6 @@ t('the setup button stores your key and loads your own stats', async () => {
   assert.equal(saved.me.factionId, 42, 'faction learned');
   assert.equal(saved.me.bs, 2000000, 'battle stats summed from the four stats');
 
-  // The panel must reflect it back, not just store it.
   assert.match(doc.querySelector('section[data-tab="setup"]').textContent, /2\.00m/);
   dom.window.close();
 });
@@ -481,8 +488,7 @@ t('a manually entered ID list drives a scan', async () => {
 
   assert.equal(resultRows(doc).length, 1, 'only the requested player');
   assert.match(row.textContent, /Carol/, 'it is the right player');
-  // Carol is far too strong for the default filters, so the cheap screen
-  // settles her without a Torn request - and says so in the row.
+
   assert.ok(
     !calls.some((u) => /api\.torn\.com\/user\/3333333\?/.test(u)),
     'no Torn request was spent on a player the screen already ruled out'
@@ -506,8 +512,7 @@ t('export buttons do not throw when the clipboard is unavailable', async () => {
   ['Copy JSON', 'Copy CSV'].forEach((label) => {
     const btn = buttons.find((b) => b.textContent === label);
     assert.ok(btn, label + ' button exists');
-    // jsdom has neither navigator.clipboard nor execCommand; the script
-    // must degrade quietly instead of breaking the panel.
+
     btn.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
   });
 
@@ -540,7 +545,7 @@ t('clearing the cache actually empties stored player data', async () => {
 });
 
 t('never scans your own id, even on your own bazaar page', async () => {
-  // Pretend player 1111111 is us, and that we are standing on their page.
+
   const seed = JSON.parse(JSON.stringify(SEED_SETTINGS));
   seed.me.id = 1111111;
   const { dom, win, calls, store } = boot(seed);
@@ -570,7 +575,7 @@ t('never scans your own id, even on your own bazaar page', async () => {
 
 t('learns your own id when it is unknown, so self is still excluded', async () => {
   const seed = JSON.parse(JSON.stringify(SEED_SETTINGS));
-  seed.me.id = 0; // never loaded stats
+  seed.me.id = 0;
   seed.me.bs = 2000000;
   const { dom, win, store } = boot(seed);
   const doc = win.document;
@@ -583,10 +588,6 @@ t('learns your own id when it is unknown, so self is still excluded', async () =
 
   dom.window.close();
 });
-
-/* ------------------------------------------------------------------ */
-/* Opener living inside Torn's own footer bar                          */
-/* ------------------------------------------------------------------ */
 
 t('clones Torn footer button so the opener sits inline with the others', () => {
   const { dom, win } = boot();
@@ -609,7 +610,6 @@ t('clones Torn footer button so the opener sits inline with the others', () => {
   );
   assert.ok(btn.querySelector('svg'), 'it has an icon');
 
-  // The floating fallback must be visible only when there is no footer.
   const fab = doc.getElementById('tbms-fab');
   assert.equal(fab.style.display, 'none', 'floating fallback hidden when footer exists');
   dom.window.close();
@@ -639,10 +639,11 @@ t('footer opener toggles the panel and carries the match badge', async () => {
 });
 
 t('falls back to the corner square when the footer is absent', () => {
-  // A page with no Torn footer buttons (Torn PDA / layout change).
+
   const bare = '<!doctype html><html><body><div id="app"></div></body></html>';
   const dom = new JSDOM(bare, { url: 'https://www.torn.com/', runScripts: 'outside-only' });
   const win = dom.window;
+  win.close = NEUTER_CLOSE;
   const store = new Map([['settings', JSON.stringify(SEED_SETTINGS)]]);
   win.GM_getValue = (k, d) => (store.has(k) ? store.get(k) : d);
   win.GM_setValue = (k, v) => store.set(k, v);
@@ -659,16 +660,11 @@ t('falls back to the corner square when the footer is absent', () => {
   dom.window.close();
 });
 
-/* ------------------------------------------------------------------ */
-/* Seller lists as data rather than as rendered markup                 */
-/* ------------------------------------------------------------------ */
-
 t('typing an item name finds it in the picker', async () => {
   const { dom, win } = boot();
   const doc = win.document;
   const input = doc.getElementById('tbms-item-input');
 
-  // Wait for the index to land, then type a name the way a user would.
   await waitFor(() => doc.getElementById('tbms-item-input'), 3000, 'the picker');
   input.value = 'xanax';
   input.dispatchEvent(new win.Event('input', { bubbles: true }));
@@ -680,15 +676,13 @@ t('typing an item name finds it in the picker', async () => {
 
   assert.match(suggest.textContent, /Xanax/, 'the typed name resolves');
   assert.match(suggest.textContent, /206/, 'and shows the id it maps to');
-  // A dropdown positioned against the panel instead of the input renders
-  // off the bottom edge and is never seen, so pin the relationship.
+
   assert.equal(
     suggest.parentNode.id,
     'tbms-item-row',
     'the suggestion list hangs off the input row, not the panel'
   );
 
-  // Clicking the suggestion selects it.
   suggest.firstChild.dispatchEvent(new win.MouseEvent('mousedown', { bubbles: true }));
   assert.equal(input.value, 'Xanax', 'the chosen name fills the box');
   assert.equal(input.getAttribute('data-item-id'), '206', 'and the id is pinned');
@@ -715,7 +709,6 @@ t('scans an item\'s bazaar sellers from data, not from the page', async () => {
   const { dom, win, calls, store } = boot();
   const doc = win.document;
 
-  // Bazaar listings for the item.
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
     return function (opts) {
@@ -763,7 +756,6 @@ t('scans an item\'s bazaar sellers from data, not from the page', async () => {
     'nothing was read off the page for this path'
   );
 
-  // Settings writes are debounced, so wait for the flush.
   await waitFor(
     () => JSON.parse(store.get('settings') || '{}').scan.lastItemId === 206,
     3000,
@@ -781,7 +773,7 @@ t('falls back to the community scanner when Torn lists nothing', async () => {
     return function (opts) {
       if (/v2\/market\/206\/bazaar/.test(opts.url)) {
         calls.push(opts.url);
-        // Torn knows of no bazaar offers; the scanner does.
+
         setTimeout(() => opts.onload({ status: 200, responseText: JSON.stringify({ bazaar: [] }) }), 0);
         return;
       }
@@ -808,7 +800,7 @@ t('falls back to the community scanner when Torn lists nothing', async () => {
   })();
 
   await waitFor(() => Object.keys(doc.querySelectorAll('.tbms-suggest-row')).length >= 0, 200, 'picker ready');
-  // A raw id needs no index at all, which is the fallback when the list fails.
+
   doc.getElementById('tbms-item-input').value = '206';
   doc.getElementById('tbms-item-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
 
@@ -839,7 +831,7 @@ t('the third-party source can be switched off entirely', async () => {
   })();
 
   await waitFor(() => Object.keys(doc.querySelectorAll('.tbms-suggest-row')).length >= 0, 200, 'picker ready');
-  // A raw id needs no index at all, which is the fallback when the list fails.
+
   doc.getElementById('tbms-item-input').value = '206';
   doc.getElementById('tbms-item-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
 
@@ -852,10 +844,6 @@ t('the third-party source can be switched off entirely', async () => {
   dom.window.close();
 });
 
-/* ------------------------------------------------------------------ */
-/* Panel geometry                                                      */
-/* ------------------------------------------------------------------ */
-
 t('the panel can be moved and the position is remembered', async () => {
   const { dom, win, store } = boot();
   const doc = win.document;
@@ -864,8 +852,6 @@ t('the panel can be moved and the position is remembered', async () => {
 
   stubLayout(panel);
 
-  // The panel may already have been auto-placed, so assert the delta the
-  // drag applies rather than an absolute corner.
   const before = panel.getBoundingClientRect();
   head.dispatchEvent(new win.MouseEvent('mousedown', { bubbles: true, clientX: 500, clientY: 120 }));
   doc.dispatchEvent(new win.MouseEvent('mousemove', { bubbles: true, clientX: 460, clientY: 160 }));
@@ -929,10 +915,6 @@ t('a dragged panel keeps its spot when reopened', () => {
   dom.window.close();
 });
 
-/* ------------------------------------------------------------------ */
-/* Key level reporting                                                 */
-/* ------------------------------------------------------------------ */
-
 t('key check names the exact selection a Limited key is needed for', async () => {
   const { dom, win } = boot();
   const doc = win.document;
@@ -940,8 +922,7 @@ t('key check names the exact selection a Limited key is needed for', async () =>
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
     return function (opts) {
-      // The probe looks for any real player to test other-player selections
-      // against, so give it one.
+
       if (/api\.torn\.com\/user\/1\?selections=profile/.test(opts.url)) {
         setTimeout(
           () =>
@@ -956,7 +937,7 @@ t('key check names the exact selection a Limited key is needed for', async () =>
         );
         return;
       }
-      // Pretend the key is too weak for another player's property.
+
       if (/v2\/user\/\d+\/property/.test(opts.url)) {
         setTimeout(
           () =>
@@ -1003,20 +984,10 @@ t('the setup tab states which access level to use', () => {
   dom.window.close();
 });
 
-/* ------------------------------------------------------------------ */
-/* API key fields must not look like logins to the browser             */
-/* ------------------------------------------------------------------ */
-
-/* ------------------------------------------------------------------ */
-/* Watchlist                                                           */
-/* ------------------------------------------------------------------ */
-
-/** Boot with a watchlist already stored, as after a reload. */
 function bootWatching(entries) {
   return boot(SEED_SETTINGS, { watch_v1: JSON.stringify(entries) });
 }
 
-/** Serve one player's state, and let the test change it between checks. */
 function servePlayer(win, id, status, extra) {
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
@@ -1044,8 +1015,7 @@ function watchRowText(doc) {
 }
 
 t('a watched player who goes back into hospital stops being ready', async () => {
-  // "Ready" used to be set once and never cleared, so somebody discharged
-  // and then hospitalised again stayed flagged as back for good.
+
   const seeded = {
     2222222: {
       id: 2222222,
@@ -1060,7 +1030,6 @@ t('a watched player who goes back into hospital stops being ready', async () => 
   const { dom, win } = bootWatching(seeded);
   const doc = win.document;
 
-  // They are back in hospital with a long stay.
   servePlayer(win, 2222222, {
     state: 'Hospital',
     description: 'In hospital',
@@ -1081,14 +1050,13 @@ t('a watched player who goes back into hospital stops being ready', async () => 
 });
 
 t('out of a foreign hospital is still abroad, so not a target', async () => {
-  // Discharged abroad means out of the country, not reachable. The countdown
-  // must not read as if they become attackable when it runs out.
+
   const seeded = {
     3333333: {
       id: 3333333,
       name: 'Watched',
       state: 'Hospital',
-      until: Math.floor(Date.now() / 1000) - 10, // the stay is over
+      until: Math.floor(Date.now() / 1000) - 10,
       ready: false,
       checkedAt: 0
     }
@@ -1096,7 +1064,6 @@ t('out of a foreign hospital is still abroad, so not a target', async () => {
   const { dom, win } = bootWatching(seeded);
   const doc = win.document;
 
-  // Out of hospital, but abroad.
   servePlayer(win, 3333333, { state: 'Abroad', description: 'Abroad', until: 0 });
 
   doc.querySelector('.tbms-tab[data-tab="watch"]').dispatchEvent(
@@ -1140,15 +1107,8 @@ t('a foreign hospital is still shown as abroad, not as available', async () => {
   dom.window.close();
 });
 
-/* ------------------------------------------------------------------ */
-/* Results card (the corner notification)                              */
-/* ------------------------------------------------------------------ */
-
 t('the scanner is asked for its maximum, not a number it rejects', async () => {
-  // The endpoint caps at 100 and answers anything above that with a 403
-  // carrying no JSON. Requesting 200 meant the scanner silently returned
-  // nothing, leaving only Torn's short list - which looked like the whole
-  // market and stalled a scan after about ten sellers.
+
   const { dom, win, calls } = boot();
   const doc = win.document;
 
@@ -1168,9 +1128,7 @@ t('the scanner is asked for its maximum, not a number it rejects', async () => {
 });
 
 t('a bazaar page scan values the stock it can plainly see', async () => {
-  // Straight from the report: donhordking's bazaar, 18 pangolin scales at
-  // 205k, and the table said "$0 on sale". The bazaar arrived keyed by item
-  // id rather than as an array, and that parsed as empty.
+
   const BAZAAR_MAP = {
     1: { ID: 1, name: 'Hydrogen Tank', quantity: 6, price: 25760, market_price: 23000 },
     2: { ID: 2, name: 'Spy Camera', quantity: 3, price: 492, market_price: 480 },
@@ -1186,10 +1144,10 @@ t('a bazaar page scan values the stock it can plainly see', async () => {
     '</body></html>';
   const dom = new JSDOM(page, {
     url: 'https://www.torn.com/bazaar.php?userId=4425009',
-    runScripts: 'outside-only',
-    pretendToBeVisual: true
+    runScripts: 'outside-only'
   });
   const win = dom.window;
+  win.close = NEUTER_CLOSE;
   const store = new Map([['settings', JSON.stringify(SEED_SETTINGS)]]);
   win.GM_getValue = (k, d) => (store.has(k) ? store.get(k) : d);
   win.GM_setValue = (k, v) => store.set(k, v);
@@ -1225,16 +1183,14 @@ t('a bazaar page scan values the stock it can plainly see', async () => {
   const row = resultRows(doc)[0];
   assert.match(row.textContent, /donhordking/);
   assert.doesNotMatch(row.textContent, /\$0 on sale/, 'not scored as empty');
-  // A page scan has no item to value, so their whole bazaar is shown as
-  // context and no profit is claimed from it.
+
   assert.match(row.textContent, /bazaar \$3\.89m/, 'the stock is shown: ' + row.textContent);
   assert.match(row.textContent, /no item selected/, 'and the profit says why not');
   dom.window.close();
 });
 
 t('an item scan values only that item, not the rest of their stock', async () => {
-  // The bazaar in the report holds pangolin scales plus twelve other items.
-  // Picking the item must give the item's figure, not the bazaar total.
+
   const BAZAAR = {
     1: { ID: 1, name: 'Hydrogen Tank', quantity: 6, price: 25760, market_price: 23000 },
     4: { ID: 4, name: 'Pangolin Scales', quantity: 18, price: 205000, market_price: 205000 },
@@ -1246,7 +1202,7 @@ t('an item scan values only that item, not the rest of their stock', async () =>
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
     return function (opts) {
-      // The listing names the seller and the item.
+
       if (/v2\/market\/4\/bazaar/.test(opts.url)) {
         setTimeout(
           () =>
@@ -1309,8 +1265,6 @@ t('a bazaar Torn did not send says so instead of showing $0', async () => {
   const { dom, win } = boot();
   const doc = win.document;
 
-  // Refuse every request that asks for the bazaar, so the ladder narrows
-  // past it - exactly what produces an absent bazaar in the wild.
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
     return function (opts) {
@@ -1348,7 +1302,6 @@ t('switching tabs keeps the results and everything else on screen', async () => 
   const { dom, win } = boot();
   const doc = win.document;
 
-  // Something in each tab worth losing.
   doc.getElementById('tbms-item-input').value = 'half typed item';
   const interval = doc.getElementById('tbms-auto-interval');
   interval.value = '45';
@@ -1380,15 +1333,13 @@ t('switching tabs keeps the results and everything else on screen', async () => 
 });
 
 t('the last scan comes back after the page reloads', async () => {
-  // A full page load is what a Torn tab change actually is, and it used to
-  // wipe the table.
+
   const first = boot();
   first.win.document
     .getElementById('tbms-scan-btn')
     .dispatchEvent(new first.win.MouseEvent('click', { bubbles: true }));
   await waitFor(() => resultRows(first.win.document).length === 3, 8000, 'the first scan');
 
-  // Let the queued write land before standing in for a reload.
   await waitFor(
     () => first.store.get('results_v1') || null,
     3000,
@@ -1397,7 +1348,6 @@ t('the last scan comes back after the page reloads', async () => {
   const persisted = first.store.get('results_v1');
   first.dom.window.close();
 
-  // Fresh page, same storage.
   const second = boot(SEED_SETTINGS, { results_v1: persisted });
   const doc2 = second.win.document;
   assert.equal(resultRows(doc2).length, 3, 'the results are back without scanning again');
@@ -1411,7 +1361,6 @@ t('a Clear button empties the results and leaves the watchlist alone', async () 
   doc.getElementById('tbms-scan-btn').dispatchEvent(new first.win.MouseEvent('click', { bubbles: true }));
   await waitFor(() => resultRows(doc).length === 3, 8000, 'the scan');
 
-  // Watch one of them, so the other tab has something worth keeping.
   const row = resultRows(doc)[0];
   const watched = row.querySelector('a.tbms-link').textContent;
   row.querySelectorAll('a.tbms-link').forEach((a) => {
@@ -1446,7 +1395,6 @@ t('a Clear button empties the results and leaves the watchlist alone', async () 
   assert.equal(watchRows().length, 1, 'the watchlist survives');
   assert.match(watchRows()[0].textContent, new RegExp(watched), 'still watching ' + watched);
 
-  // Reloading with the same storage must not bring the cleared list back.
   const carried = {};
   first.store.forEach((v, k) => {
     if (k !== 'settings') carried[k] = v;
@@ -1478,7 +1426,6 @@ t('restored results are re-scored against the filters as they are now', async ()
   const persisted = first.store.get('results_v1');
   first.dom.window.close();
 
-  // Come back with a filter that nothing can pass.
   const strict = JSON.parse(JSON.stringify(SEED_SETTINGS));
   strict.filters = { maxFairFight: { on: true, value: 1.0 } };
   const second = boot(strict, { results_v1: persisted });
@@ -1495,7 +1442,7 @@ t('restored results are re-scored against the filters as they are now', async ()
 
 t('a stored result set that has gone stale is not restored', async () => {
   const old = JSON.stringify({
-    at: Date.now() - 13 * 3600 * 1000, // past the 12h window
+    at: Date.now() - 13 * 3600 * 1000,
     label: 'yesterday',
     subjects: [{ id: 42, name: 'Ancient', value: 1, loot: 1 }]
   });
@@ -1514,11 +1461,10 @@ t('a scan that finds matches raises a card carrying the actions', async () => {
   await waitFor(() => doc.getElementById('tbms-results-toast'), 8000, 'the card to appear');
 
   const card = doc.getElementById('tbms-results-toast');
-  // In this fixture only Alice survives every filter, so the card says one.
+
   assert.match(card.textContent, /1 match/, 'it counts the matches');
   assert.match(card.textContent, /Alice/, 'and names them');
 
-  // Every action for a result, without opening the panel.
   const links = Array.from(card.querySelectorAll('a.tbms-toast-btn'));
   const attack = links.find((a) => a.textContent === 'attack');
   const bazaar = links.find((a) => a.textContent === 'bazaar');
@@ -1545,7 +1491,6 @@ t('the card can be dismissed and does not spring back', async () => {
   );
   assert.equal(doc.getElementById('tbms-results-toast'), null, 'it is gone');
 
-  // Re-scoring the same results must not re-raise it.
   doc.querySelector('.tbms-tab[data-tab="filters"]').dispatchEvent(
     new win.MouseEvent('click', { bubbles: true })
   );
@@ -1597,7 +1542,7 @@ t('the auto-scan interval is editable and reschedules the loop', async () => {
 
   const input = doc.getElementById('tbms-auto-interval');
   assert.ok(input, 'the interval field exists');
-  // The seed does not set it, so the default is what should be shown.
+
   assert.equal(input.value, '60', 'shows the current interval');
 
   input.value = '45';
@@ -1607,7 +1552,6 @@ t('the auto-scan interval is editable and reschedules the loop', async () => {
     return s.scan && s.scan.auto && s.scan.auto.intervalSec === 45;
   }, 3000, 'the interval to be saved');
 
-  // Nonsense is clamped rather than accepted.
   input.value = '1';
   input.dispatchEvent(new win.Event('change', { bubbles: true }));
   await waitFor(() => {
@@ -1622,8 +1566,6 @@ t('players who will be free soon are watched automatically', async () => {
   const { dom, win } = boot();
   const doc = win.document;
 
-  // Give Bob a release time: he is in hospital with 4 minutes left, and the
-  // watch window is 30 minutes by default.
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
     return function (opts) {
@@ -1678,7 +1620,6 @@ t('a watched player is flagged the moment they are back', async () => {
   const { dom, win } = boot(seed);
   const doc = win.document;
 
-  // Bob starts in hospital with four minutes to go, so a scan watches him.
   let bobReleased = false;
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
@@ -1731,7 +1672,6 @@ t('a watched player is flagged the moment they are back', async () => {
     'Bob to be watched'
   );
 
-  // He is discharged.
   bobReleased = true;
   const checkBtn = Array.from(doc.querySelectorAll('section[data-tab="watch"] button')).find(
     (b) => b.textContent === 'Check now'
@@ -1753,8 +1693,7 @@ t('a watched player is flagged the moment they are back', async () => {
 });
 
 t('the watchlist survives a page reload', async () => {
-  // The list must already be in storage when the script starts, which is
-  // exactly what happens after a refresh.
+
   const seeded = {
     watch_v1: JSON.stringify({
       555: {
@@ -1811,14 +1750,8 @@ t('the watch tab is labelled with how many are back', () => {
   dom.window.close();
 });
 
-/* ------------------------------------------------------------------ */
-/* API economy: the free sources go first                              */
-/* ------------------------------------------------------------------ */
-
 t('sellers from every source are merged, not just the first that answers', async () => {
-  // Torn's own listing is short; the scanner knows of more. Stopping at the
-  // first source that responded meant a common item could exhaust itself
-  // after ten sellers, because the fuller list was never consulted.
+
   const { dom, win, calls } = boot();
   const doc = win.document;
 
@@ -1847,7 +1780,7 @@ t('sellers from every source are merged, not just the first that answers', async
         return;
       }
       if (/weav3r\.dev\/api\/marketplace\/206/.test(opts.url)) {
-        calls.push(opts.url); // intercepted, so record it here
+        calls.push(opts.url);
         setTimeout(
           () =>
             opts.onload({
@@ -1858,7 +1791,7 @@ t('sellers from every source are merged, not just the first that answers', async
         );
         return;
       }
-      // Give the scanner's sellers a profile so their rows can render.
+
       const m = opts.url.match(/api\.torn\.com\/user\/(\d+)\?/);
       if (m && ['3333333', '4444444', '5555555', '6666666'].includes(m[1])) {
         calls.push(opts.url);
@@ -1890,7 +1823,6 @@ t('sellers from every source are merged, not just the first that answers', async
   doc.getElementById('tbms-item-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
   await waitFor(() => resultRows(doc).length >= 6, 12000, 'sellers from both sources');
 
-  // The scanner was consulted even though Torn answered first.
   assert.ok(
     calls.some((u) => /weav3r\.dev\/api\/marketplace\/206/.test(u)),
     'the fuller source was asked'
@@ -1904,8 +1836,7 @@ t('sellers from every source are merged, not just the first that answers', async
 });
 
 t('a page scan on an item page still prices what it finds', async () => {
-  // Skeed sells through the item market, so his bazaar lookup finds
-  // nothing. With the item known from the page, his listing prices him.
+
   const page =
     '<!doctype html><html><body>' +
     '<div id="notes_panel_button" class="icon-wrap"><svg></svg></div>' +
@@ -1913,10 +1844,10 @@ t('a page scan on an item page still prices what it finds', async () => {
     '</body></html>';
   const dom = new JSDOM(page, {
     url: 'https://www.torn.com/page.php?sid=ItemMarket#/market/view=search&itemID=206',
-    runScripts: 'outside-only',
-    pretendToBeVisual: true
+    runScripts: 'outside-only'
   });
   const win = dom.window;
+  win.close = NEUTER_CLOSE;
   const store = new Map([['settings', JSON.stringify(SEED_SETTINGS)]]);
   win.GM_getValue = (k, d) => (store.has(k) ? store.get(k) : d);
   win.GM_setValue = (k, v) => store.set(k, v);
@@ -1940,7 +1871,7 @@ t('a page scan on an item page still prices what it finds', async () => {
         faction_id: 0,
         status: { state: 'Okay', description: 'Okay' },
         last_action: { timestamp: Math.floor(Date.now() / 1000) - 400 },
-        // Selling on the item market, so their bazaar is empty.
+
         bazaar: []
       });
     }
@@ -1962,16 +1893,10 @@ t('a page scan on an item page still prices what it finds', async () => {
   dom.window.close();
 });
 
-/* ------------------------------------------------------------------ */
-/* Repeat scans must surface new names, not the same ones              */
-/* ------------------------------------------------------------------ */
-
 t('a seller listing the item is a hit even when their bazaar is empty', async () => {
   const { dom, win } = boot();
   const doc = win.document;
 
-  // Someone selling 30 of the item at the going rate, whose bazaar lookup
-  // comes back with nothing - the reported "should have been a hit" case.
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
     return function (opts) {
@@ -2000,8 +1925,7 @@ t('a seller listing the item is a hit even when their bazaar is empty', async ()
                 faction_id: 0,
                 status: { state: 'Okay', description: 'Okay' },
                 last_action: { timestamp: Math.floor(Date.now() / 1000) - 120 },
-                // Their bazaar is empty, as Torn often reports for someone
-                // selling through the item market.
+
                 bazaar: []
               })
             }),
@@ -2033,7 +1957,6 @@ t('the profit cell shows the mug as a band, because Torn rolls it', async () => 
   const { dom, win } = boot();
   const doc = win.document;
 
-  // 30 of the item at 40k, so the row carries a real profit figure.
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
     return function (opts) {
@@ -2082,10 +2005,7 @@ t('the profit cell shows the mug as a band, because Torn rolls it', async () => 
   const cell = Array.from(row.querySelectorAll('td')).find((td) => /worst/i.test(td.title || ''));
   assert.ok(cell, 'the loot cell carries the band: ' + row.textContent);
 
-  // On screen: the band, not a single made-up percentage.
   assert.match(cell.textContent, /5-10% mug/, 'the band is on screen: ' + cell.textContent);
-
-  // In the tooltip: the three cases, each with its own rate.
   assert.match(cell.title, /Mug +5-10% of the \$1\.20m you hand over +\(no mug bonuses\)/);
   assert.match(cell.title, /worst +\+\$60\.0k +\(5%\)/);
   assert.match(cell.title, /likely +\+\$78\.0k +\(6\.5%\)/);
@@ -2119,7 +2039,6 @@ t('the merits and Plunder fields live in Setup and stick', async () => {
   assert.equal(saved.mugMerits, 10);
   assert.equal(saved.mugPlunder, 25);
 
-  // And nonsense is clamped rather than trusted.
   plunder.value = '900';
   plunder.dispatchEvent(new win.Event('change', { bubbles: true }));
   assert.equal(plunder.value, '49', 'the weapon bonus cannot exceed the game cap');
@@ -2130,7 +2049,6 @@ t('repeating an item scan accumulates new names instead of repeating', async () 
   const { dom, win } = boot();
   const doc = win.document;
 
-  // The bazaar gains a seller between passes.
   let sellers = [{ ID: 1111111, cost: 800000, quantity: 30 }];
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
@@ -2142,7 +2060,7 @@ t('repeating an item scan accumulates new names instead of repeating', async () 
         );
         return;
       }
-      // The newly listed seller, who the shared stub does not know about.
+
       if (/api\.torn\.com\/user\/4444444\?/.test(opts.url)) {
         setTimeout(
           () =>
@@ -2175,7 +2093,6 @@ t('repeating an item scan accumulates new names instead of repeating', async () 
   await waitFor(() => resultRows(doc).length === 1, 8000, 'the first auto pass');
   assert.match(resultRows(doc)[0].textContent, /Alice/, 'with the first seller');
 
-  // A new seller appears, and starting auto-scan runs a pass immediately.
   sellers = [
     { ID: 1111111, cost: 800000, quantity: 30 },
     { ID: 4444444, cost: 810000, quantity: 12 }
@@ -2184,8 +2101,6 @@ t('repeating an item scan accumulates new names instead of repeating', async () 
   const autoBtn = doc.getElementById('tbms-auto-btn');
   autoBtn.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
 
-  // Alice is already known, so only the newly listed seller is added - and
-  // the table grows to hold both rather than repeating Alice alone.
   await waitFor(() => resultRows(doc).length === 2, 9000, 'the new seller to appear');
 
   const names = Array.from(resultRows(doc)).map((tr) => tr.textContent.slice(0, 24));
@@ -2207,8 +2122,6 @@ t('Torn is only asked about players the free sources could not rule out', async 
   const ffCalls = calls.filter((u) => u.includes('ffscouter'));
   const tornCalls = calls.filter((u) => /api\.torn\.com\/user\/\d+\?/.test(u));
 
-  // Three sellers: FFScouter judges all three in one batched request and
-  // Carol (FF 9.4) is dropped, so Torn is asked about two.
   assert.equal(ffCalls.length, 1, 'one batched call covers every candidate');
   assert.equal(tornCalls.length, 2, 'only the survivors cost a Torn request');
   assert.ok(
@@ -2239,8 +2152,6 @@ t('key fields are not password inputs, so nothing offers to save them', () => {
   const { dom, win } = boot();
   const doc = win.document;
 
-  // A single type="password" anywhere is enough for Chrome to offer to
-  // save a login and for managers to start autofilling.
   assert.equal(
     doc.querySelectorAll('input[type="password"]').length,
     0,
@@ -2255,16 +2166,13 @@ t('key fields are not password inputs, so nothing offers to save them', () => {
   assert.equal(key.getAttribute('autocapitalize'), 'off');
   assert.equal(key.getAttribute('autocorrect'), 'off');
 
-  // The opt-outs the major managers actually honour.
   assert.equal(key.getAttribute('data-lpignore'), 'true', 'LastPass opts out');
   assert.equal(key.getAttribute('data-1p-ignore'), 'true', '1Password opts out');
   assert.equal(key.getAttribute('data-bwignore'), 'true', 'Bitwarden opts out');
   assert.equal(key.getAttribute('data-form-type'), 'other', 'Dashlane opts out');
 
-  // Masked visually, which is why it does not need to be a password field.
   assert.ok(key.classList.contains('tbms-masked'), 'it is CSS-masked');
 
-  // And it is not inside a form, so there is no login to submit.
   assert.equal(key.closest('form'), null, 'no form wrapper');
   dom.window.close();
 });
@@ -2299,10 +2207,6 @@ t('the optional FFScouter key field follows the same rules', () => {
   dom.window.close();
 });
 
-/* ------------------------------------------------------------------ */
-/* Auto-scan (continuous, with a state that survives a refresh)        */
-/* ------------------------------------------------------------------ */
-
 t('auto-scan starts, pauses and remembers which it is', async () => {
   const { dom, win, store } = boot();
   const doc = win.document;
@@ -2331,7 +2235,7 @@ t('auto-scan starts, pauses and remembers which it is', async () => {
 });
 
 t('a running auto-scan resumes by itself after a refresh', async () => {
-  // "After a refresh" == a fresh page load with the saved state.
+
   const seed = JSON.parse(JSON.stringify(SEED_SETTINGS));
   seed.scan.auto = { on: true, itemId: 206, intervalSec: 120 };
   const { dom, win, calls } = boot(seed);
@@ -2368,10 +2272,6 @@ t('a paused auto-scan stays paused after a refresh', async () => {
   dom.window.close();
 });
 
-/* ------------------------------------------------------------------ */
-/* Rows for sellers we could not fully read                            */
-/* ------------------------------------------------------------------ */
-
 t('a seller whose data is private still appears, by name', async () => {
   const { dom, win } = boot();
   const doc = win.document;
@@ -2379,7 +2279,7 @@ t('a seller whose data is private still appears, by name', async () => {
   win.GM_xmlhttpRequest = (() => {
     const base = win.GM_xmlhttpRequest;
     return function (opts) {
-      // Torn answers "selection is private" for this one.
+
       if (/api\.torn\.com\/user\/2222222\?/.test(opts.url)) {
         setTimeout(
           () =>
@@ -2425,11 +2325,9 @@ t('re-filtering sorts matches first exactly like a scan does', async () => {
   doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
   await waitFor(() => resultRows(doc).length === 3, 8000, 'scan');
 
-  // The scan puts the single match on top.
   let first = resultRows(doc)[0];
   assert.ok(first.classList.contains('tbms-match'), 'scan sorted the match first');
 
-  // Re-score with everything relaxed: now all three are matches.
   doc.querySelector('.tbms-tab[data-tab="filters"]').dispatchEvent(
     new win.MouseEvent('click', { bubbles: true })
   );
@@ -2458,7 +2356,6 @@ t('waits out a Torn rate limit and then resumes by itself', async () => {
   const { dom, win, store } = boot();
   const doc = win.document;
 
-  // Rate limit exactly one player once, then behave normally.
   let limited = false;
   const base = win.GM_xmlhttpRequest;
   win.GM_xmlhttpRequest = function (opts) {
@@ -2481,7 +2378,6 @@ t('waits out a Torn rate limit and then resumes by itself', async () => {
 
   doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
 
-  // All three sellers must still land, including the one that got limited.
   const rows = await waitFor(
     () => {
       const r = resultRows(doc);
@@ -2492,7 +2388,6 @@ t('waits out a Torn rate limit and then resumes by itself', async () => {
   );
   assert.equal(rows.length, 3, 'the rate limited player was retried, not dropped');
 
-  // The wait must have been announced rather than looking like a hang.
   const logs = store.get('settings');
   assert.ok(logs, 'settings still persisted through the pause');
   assert.match(
@@ -2500,7 +2395,414 @@ t('waits out a Torn rate limit and then resumes by itself', async () => {
     /Alice|rate limit|resuming|Fetched/i
   );
 
-  // And the scan must not have given up with an error.
   assert.doesNotMatch(doc.getElementById('tbms-foot').textContent, /stopping|rejected/i);
+  dom.window.close();
+});
+
+t('mounts and scans when injected at document-start like Torn PDA', async () => {
+
+  const { dom, win } = bootPDA();
+  const doc = win.document;
+
+  assert.ok(doc.getElementById('tbms-root'), 'the UI mounted even with no <body> at injection time');
+  assert.ok(doc.getElementById('tbms-panel'), 'the panel is there');
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  const rows = await waitFor(
+    () => {
+      const r = resultRows(doc);
+      return r.length === 3 ? r : null;
+    },
+    9000,
+    'a full scan to finish on a PDA-style boot'
+  );
+  assert.equal(rows.length, 3, 'the whole flow works without GM_registerMenuCommand');
+  dom.window.close();
+});
+
+t('copies through GM_setClipboard, which Torn PDA provides', async () => {
+  const { dom, win } = boot();
+  const doc = win.document;
+
+  let copied = null;
+  win.GM_setClipboard = (text) => {
+    copied = text;
+  };
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 3, 9000, 'the scan');
+
+  const jsonBtn = Array.from(doc.querySelectorAll('section[data-tab="results"] button')).find((b) =>
+    /Copy JSON/.test(b.textContent)
+  );
+  jsonBtn.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+
+  assert.ok(copied && /Alice/.test(copied), 'the export went through GM_setClipboard');
+  dom.window.close();
+});
+
+t('keeps the half-typed item query when the page changes', async () => {
+  const first = boot();
+  const input = first.win.document.getElementById('tbms-item-input');
+  input.value = 'xanax';
+  input.dispatchEvent(new first.win.Event('input', { bubbles: true }));
+
+  await waitFor(() => {
+    const saved = JSON.parse(first.store.get('settings') || '{}');
+    return saved.scan && saved.scan.itemQuery === 'xanax';
+  }, 3000, 'the query to be written to storage');
+
+  const carried = {};
+  first.store.forEach((v, k) => {
+    if (k !== 'settings') carried[k] = v;
+  });
+  const savedSettings = first.store.get('settings');
+  first.dom.window.close();
+
+  const second = boot(JSON.parse(savedSettings), carried);
+  assert.equal(
+    second.win.document.getElementById('tbms-item-input').value,
+    'xanax',
+    'the query is still in the box after a full page change'
+  );
+  second.dom.window.close();
+});
+
+t('keeps results and query in step from one page to the next', async () => {
+  const first = boot();
+  const doc = first.win.document;
+  const input = doc.getElementById('tbms-item-input');
+  input.value = 'Xanax';
+  input.dispatchEvent(new first.win.Event('input', { bubbles: true }));
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new first.win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length === 3, 9000, 'the scan');
+  await waitFor(() => first.store.get('results_v1') || null, 3000, 'the results write');
+  await waitFor(() => {
+    const saved = JSON.parse(first.store.get('settings') || '{}');
+    return saved.scan && saved.scan.itemQuery === 'Xanax';
+  }, 3000, 'the query write');
+
+  const persistedResults = first.store.get('results_v1');
+  const persistedSettings = first.store.get('settings');
+  first.dom.window.close();
+
+  const second = bootWithHtml(
+    PAGE_HTML,
+    JSON.parse(persistedSettings),
+    { results_v1: persistedResults },
+    'https://www.torn.com/item.php?id=206'
+  );
+  const doc2 = second.win.document;
+  assert.equal(resultRows(doc2).length, 3, 'the shortlist follows you to the next page');
+  assert.equal(
+    doc2.getElementById('tbms-item-input').value,
+    'Xanax',
+    'and the query you were on is kept, not replaced by the page you happen to be on'
+  );
+  second.dom.window.close();
+});
+
+t('never targets your hardcoded profile, even before your key is known', async () => {
+  const page = `<!doctype html><html><body>
+    <div class="bazaar-list">
+      <a href="/profiles.php?XID=1111111">Alice</a>
+      <a href="/profiles.php?XID=2598210">Egco</a>
+    </div>
+  </body></html>`;
+  const seed = JSON.parse(JSON.stringify(SEED_SETTINGS));
+  seed.me.id = 0;
+  const { dom, win, calls } = bootWithHtml(page, seed);
+  const doc = win.document;
+
+  assert.equal(
+    doc.getElementById('tbms-harvest-count').textContent,
+    '1',
+    'the hardcoded profile is dropped from the page count'
+  );
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length >= 1, 9000, 'a scan');
+
+  assert.ok(
+    !calls.some((u) => /user\/2598210\?/.test(u)),
+    'Torn was never asked about the hardcoded profile'
+  );
+  assert.ok(
+    !Array.from(resultRows(doc)).some((tr) => /2598210/.test(tr.textContent)),
+    'the hardcoded profile never appears as a target'
+  );
+  dom.window.close();
+});
+
+t('a scan in one tab shows the same results in the other', async () => {
+  const shared = new Map();
+  const a = bootIn(PAGE_HTML, undefined, SEED_SETTINGS, undefined, { store: shared });
+  const b = bootIn(PAGE_HTML, undefined, SEED_SETTINGS, undefined, { store: shared });
+
+  assert.equal(resultRows(b.win.document).length, 0, 'the second tab starts empty');
+
+  a.win.document.getElementById('tbms-scan-btn').dispatchEvent(new a.win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(a.win.document).length === 3, 9000, 'the scan in the first tab');
+
+  await waitFor(
+    () => resultRows(b.win.document).length === 3,
+    7000,
+    'the second tab to pick up the results'
+  );
+  a.dom.window.close();
+  b.dom.window.close();
+});
+
+t('clearing in one tab clears the other', async () => {
+  const shared = new Map();
+  const a = bootIn(PAGE_HTML, undefined, SEED_SETTINGS, undefined, { store: shared });
+  a.win.document.getElementById('tbms-scan-btn').dispatchEvent(new a.win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(a.win.document).length === 3, 9000, 'the scan');
+  await waitFor(() => shared.get('results_v1') || null, 3000, 'the write');
+
+  const b = bootIn(PAGE_HTML, undefined, SEED_SETTINGS, undefined, { store: shared });
+  await waitFor(() => resultRows(b.win.document).length === 3, 5000, 'the second tab to restore them');
+
+  a.win.document.getElementById('tbms-clear-btn').dispatchEvent(new a.win.MouseEvent('click', { bubbles: true }));
+  assert.equal(resultRows(a.win.document).length, 0, 'gone in the first tab');
+
+  await waitFor(
+    () => resultRows(b.win.document).length === 0,
+    7000,
+    'the clear to reach the second tab'
+  );
+  a.dom.window.close();
+  b.dom.window.close();
+});
+
+t('a scan cut off by a reload resumes by itself', async () => {
+  const progress = JSON.stringify({ at: Date.now(), kind: 'item', itemId: 206, label: 'Xanax' });
+  const { dom, win, calls } = boot(SEED_SETTINGS, { scan_progress_v1: progress });
+  const doc = win.document;
+
+  await waitFor(
+    () => calls.some((u) => /v2\/market\/206\/bazaar/.test(u)),
+    8000,
+    'the resumed scan to ask for the item again'
+  );
+  await waitFor(() => resultRows(doc).length >= 1, 9000, 'the resumed scan to produce results');
+  dom.window.close();
+});
+
+t('a finished or stale scan is not resumed', async () => {
+  const stale = JSON.stringify({
+    at: Date.now() - 20 * 60 * 1000,
+    kind: 'item',
+    itemId: 206,
+    label: 'Xanax'
+  });
+  const { dom, win, calls } = boot(SEED_SETTINGS, { scan_progress_v1: stale });
+
+  await new Promise((r) => setTimeout(r, 3200));
+  assert.ok(
+    !calls.some((u) => /v2\/market\/206\/bazaar/.test(u)),
+    'the old progress record was ignored'
+  );
+  assert.equal(resultRows(win.document).length, 0, 'and nothing was scanned');
+  dom.window.close();
+});
+
+t('sweeping every bazaar ranks listings across items by net profit', async () => {
+  const seed = JSON.parse(JSON.stringify(SEED_SETTINGS));
+  seed.scan.sweep = { perPass: 2 };
+  seed.scan.fetchProperty = false;
+
+  const { dom, win, calls } = boot(seed);
+  const doc = win.document;
+
+  const INDEX = {
+    total_count: 3,
+    items: [
+      {
+        item_id: 366,
+        item_name: 'Erotic DVD',
+        market_price: 4160820,
+        bazaar_average: 4080540,
+        lowest_price: 4050000,
+        total_bazaars: 1021
+      },
+      {
+        item_id: 206,
+        item_name: 'Xanax',
+        market_price: 873392,
+        bazaar_average: 859427,
+        lowest_price: 850000,
+        total_bazaars: 663
+      },
+      {
+        item_id: 1,
+        item_name: 'Hammer',
+        market_price: 33,
+        bazaar_average: 125,
+        lowest_price: 10,
+        total_bazaars: 471
+      }
+    ]
+  };
+
+  const LISTINGS = {
+    366: {
+      item_id: 366,
+      item_name: 'Erotic DVD',
+      market_price: 4160820,
+      listings: [
+        { player_id: 2222222, player_name: 'DvdSeller', quantity: 10, price: 4050000, market_price: 4160820 }
+      ]
+    },
+    206: {
+      item_id: 206,
+      item_name: 'Xanax',
+      market_price: 873392,
+      listings: [
+        { player_id: 1111111, player_name: 'XanaxSeller', quantity: 100, price: 850000, market_price: 873392 }
+      ]
+    },
+    1: {
+      item_id: 1,
+      item_name: 'Hammer',
+      market_price: 33,
+      listings: [
+        { player_id: 3333333, player_name: 'HammerSeller', quantity: 1, price: 10, market_price: 33 }
+      ]
+    }
+  };
+
+  const PLAYERS = {
+    1111111: { name: 'XanaxSeller', ff: 2.9, bs: 1500000 },
+    2222222: { name: 'DvdSeller', ff: 1.0, bs: 1000000 },
+    3333333: { name: 'HammerSeller', ff: 1.2, bs: 1200000 }
+  };
+
+  win.GM_xmlhttpRequest = (() => {
+    const base = win.GM_xmlhttpRequest;
+    return function (opts) {
+      if (/weav3r\.dev\/api\/marketplace(?:\?|$)/.test(opts.url)) {
+        calls.push(opts.url);
+        setTimeout(() => opts.onload({ status: 200, responseText: JSON.stringify(INDEX) }), 0);
+        return;
+      }
+
+      const detail = opts.url.match(/weav3r\.dev\/api\/marketplace\/(\d+)/);
+      if (detail) {
+        calls.push(opts.url);
+        const body = LISTINGS[Number(detail[1])];
+        setTimeout(
+          () => opts.onload({ status: body ? 200 : 404, responseText: JSON.stringify(body || {}) }),
+          0
+        );
+        return;
+      }
+
+      const ff = opts.url.match(/get-stats\?.*targets=([\d,]+)/);
+      if (ff) {
+        calls.push(opts.url);
+        const asked = new Set(ff[1].split(',').map(Number));
+        const stats = Object.keys(PLAYERS)
+          .map(Number)
+          .filter((id) => asked.has(id))
+          .map((id) => ({
+            player_id: id,
+            fair_fight: PLAYERS[id].ff,
+            bs_estimate: PLAYERS[id].bs,
+            source: 'bss'
+          }));
+        setTimeout(() => opts.onload({ status: 200, responseText: JSON.stringify(stats) }), 0);
+        return;
+      }
+
+      const torn = opts.url.match(/api\.torn\.com\/user\/(\d+)\?/);
+      if (torn) {
+        calls.push(opts.url);
+        const id = Number(torn[1]);
+        const player = PLAYERS[id];
+        const body = player
+          ? {
+              profile: {
+                name: player.name,
+                level: 40,
+                last_action: NOW - 120,
+                status: { state: 'Okay', description: 'Okay' }
+              },
+              basic: { player_id: id, name: player.name, faction_id: 999 },
+              bazaar: [],
+              property: { properties: {} }
+            }
+          : { error: { code: 6, error: 'Incorrect ID' } };
+        setTimeout(() => opts.onload({ status: player ? 200 : 200, responseText: JSON.stringify(body) }), 0);
+        return;
+      }
+
+      return base(opts);
+    };
+  })();
+
+  doc.getElementById('tbms-sweep-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length >= 2, 12000, 'the first sweep pass');
+
+  doc.getElementById('tbms-sweep-btn').dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  const rows = await waitFor(() => {
+    const all = resultRows(doc);
+    return all.length === 3 ? all : null;
+  }, 12000, 'the sweep to cover the third item');
+
+  assert.ok(
+    calls.some((u) => /weav3r\.dev\/api\/marketplace\/366\?limit=100/.test(u)),
+    'the first item detail page was fetched'
+  );
+  assert.ok(
+    calls.some((u) => /weav3r\.dev\/api\/marketplace\/206\?limit=100/.test(u)),
+    'the second item detail page was fetched'
+  );
+  assert.ok(
+    calls.some((u) => /weav3r\.dev\/api\/marketplace\/1\?limit=100/.test(u)),
+    'the next pass continued with the item it had not covered'
+  );
+  assert.ok(
+    !calls.some((u) => /v2\/market\/\d+\/bazaar/.test(u)),
+    'the sweep did not spend Torn item requests'
+  );
+
+  const cells = Array.from(rows).map((tr) => Array.from(tr.children).map((td) => td.textContent.trim()));
+  const named = (needle) => cells.find((c) => c[2].includes(needle));
+  const xanax = named('Xanax');
+  const dvd = named('Erotic DVD');
+  const hammer = named('Hammer');
+
+  assert.ok(xanax && dvd && hammer, 'all three items are visible in the Item column');
+  assert.ok(
+    Number(xanax[0]) < Number(dvd[0]),
+    'the bigger-money row has the lower safety score, so score order would put it second'
+  );
+  assert.equal(xanax[2], cells[0][2], 'the table leads with the best net profit across items');
+  assert.equal(dvd[2], cells[1][2], 'the second row is the next best net profit');
+  assert.match(cells[0][6], /\+\$/);
+  assert.match(cells[1][6], /\+\$/);
+
+  const artifactDir = path.join(__dirname, 'artifacts');
+  fs.mkdirSync(artifactDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(artifactDir, 'sweep-e2e.json'),
+    JSON.stringify(
+      {
+        itemsSwept: ['Erotic DVD', 'Xanax', 'Hammer'],
+        requests: calls.filter((u) => /weav3r\.dev\/api\/marketplace\/\d+/.test(u)),
+        rows: cells.map((c) => ({
+          score: Number(c[0]),
+          seller: c[1],
+          item: c[2],
+          netProfit: c[6]
+        }))
+      },
+      null,
+      2
+    )
+  );
+
   dom.window.close();
 });
