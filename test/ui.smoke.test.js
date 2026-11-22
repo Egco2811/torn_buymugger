@@ -55,6 +55,7 @@ const RESPONSES = {
     profile: {
       name: 'Alice',
       level: 45,
+      age: 45,
       last_action: NOW - 120,
       status: { state: 'Okay', description: 'Okay' }
     },
@@ -77,13 +78,24 @@ const RESPONSES = {
       last_action: NOW - 60,
       status: { state: 'Okay', description: 'Okay' }
     }
+  }),
+
+  4444444: tornUser(4444444, {
+    profile: {
+      name: 'Dave',
+      level: 3,
+      age: 3,
+      last_action: NOW - 60,
+      status: { state: 'Hospital', description: 'In hospital for 2 mins', until: NOW + 120 }
+    }
   })
 };
 
 const FF_STATS = [
   { player_id: 1111111, fair_fight: 1.1, bs_estimate: 1500000, bs_estimate_human: '1.50m', bss_public: 120000, last_updated: NOW, source: 'bss' },
   { player_id: 2222222, fair_fight: 1.1, bs_estimate: 1500000, bs_estimate_human: '1.50m', bss_public: 120000, last_updated: NOW, source: 'bss' },
-  { player_id: 3333333, fair_fight: 12.0, bs_estimate: 900000000, bs_estimate_human: '900m', bss_public: 120000, last_updated: NOW, source: 'bss' }
+  { player_id: 3333333, fair_fight: 12.0, bs_estimate: 900000000, bs_estimate_human: '900m', bss_public: 120000, last_updated: NOW, source: 'bss' },
+  { player_id: 4444444, fair_fight: 1.1, bs_estimate: 1500000, bs_estimate_human: '1.50m', bss_public: 120000, last_updated: NOW, source: 'bss' }
 ];
 
 const ITEMS = {
@@ -341,6 +353,92 @@ t('a full scan finds the one good target and rejects the rest', async () => {
   const badge = doc.getElementById('tbms-badge');
   assert.ok(badge.classList.contains('tbms-show'), 'badge is shown');
   assert.equal(badge.textContent, '1', 'badge counts the single match');
+
+  dom.window.close();
+});
+
+t('novice players under new-player protection are excluded from results, toasts and the watchlist', async () => {
+  const html = `<!doctype html><html><body>
+    <div id="topHeader"></div>
+    <div class="bazaar-list">
+      <a href="/profiles.php?XID=1111111">Alice</a>
+      <a href="/profiles.php?XID=4444444">Dave</a>
+    </div>
+    <div id="chatRoot"><ul class="footer-icons">
+      <button id="notes_panel_button" class="icon-wrap"><svg class="icon-svg"></svg></button>
+      <button id="people_panel_button" class="icon-wrap"><svg class="icon-svg"></svg></button>
+    </ul></div>
+  </body></html>`;
+
+  const { dom, win, store, calls } = bootWithHtml(html, SEED_SETTINGS);
+  const doc = win.document;
+
+  doc.getElementById('tbms-scan-btn').dispatchEvent(
+    new win.MouseEvent('click', { bubbles: true })
+  );
+
+  const rows = await waitFor(
+    () => {
+      const btn = doc.getElementById('tbms-scan-btn');
+      const r = resultRows(doc);
+      return btn && !btn.disabled && r.length === 1 ? r : null;
+    },
+    8000,
+    'the scan to finish with only the attackable seller'
+  );
+
+  assert.equal(rows.length, 1, 'only one result row');
+  assert.match(rows[0].textContent, /Alice/, 'the attackable player is listed');
+
+  const names = Array.from(resultRows(doc)).map((tr) => tr.textContent);
+  assert.ok(!names.some((text) => /Dave/.test(text)), 'the novice is not listed');
+
+  const tornCalls = calls.filter((u) => /api\.torn\.com\/user\/4444444\?/.test(u));
+  assert.equal(tornCalls.length, 1, 'the novice was actually looked up, so the exclusion is not a page-harvest fluke');
+
+  const toast = doc.getElementById('tbms-results-toast');
+  assert.ok(toast, 'a results toast was shown');
+  assert.match(toast.textContent, /Alice/, 'the toast names the attackable player');
+  assert.ok(!/Dave/.test(toast.textContent), 'the toast never names the novice');
+
+  await waitFor(
+    () => {
+      const saved = JSON.parse(store.get('results_v1') || '{}');
+      return (saved.subjects || []).some((s) => s.id === 1111111);
+    },
+    3000,
+    'the scan results to be persisted'
+  );
+
+  const persisted = JSON.parse(store.get('results_v1') || '{}');
+  const persistedIds = (persisted.subjects || []).map((s) => s.id);
+  assert.ok(persistedIds.includes(1111111), 'the attackable player is persisted');
+  assert.ok(!persistedIds.includes(4444444), 'the novice is not persisted');
+
+  const watch = JSON.parse(store.get('watch_v1') || '{}');
+  assert.ok(!watch[4444444], 'the novice is not auto-added to the watchlist');
+
+  const artifact = {
+    test: 'novice players under new-player protection are excluded everywhere',
+    version: (SOURCE.match(/const VERSION = "([^"]+)"/) || [])[1],
+    completedAt: new Date().toISOString(),
+    candidates: [
+      { id: 1111111, name: 'Alice', age: 45, status: 'Okay', expected: 'shown' },
+      { id: 4444444, name: 'Dave', age: 3, status: 'Hospital', expected: 'excluded (new player protection)' }
+    ],
+    observed: {
+      resultRows: Array.from(resultRows(doc)).map((tr) => tr.textContent.replace(/\s+/g, ' ').trim()),
+      toastText: toast.textContent.replace(/\s+/g, ' ').trim(),
+      persistedIds,
+      watchIds: Object.keys(watch),
+      noviceProfileFetches: tornCalls.length
+    }
+  };
+  const artifactDir = path.join(__dirname, 'artifacts');
+  fs.mkdirSync(artifactDir, { recursive: true });
+  const artifactPath = path.join(artifactDir, 'novice-filter-e2e.json');
+  fs.writeFileSync(artifactPath, JSON.stringify(artifact, null, 2) + '\n');
+  assert.ok(fs.existsSync(artifactPath), 'the novice-filter artifact was written');
 
   dom.window.close();
 });

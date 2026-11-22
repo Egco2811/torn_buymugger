@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Buy-Mug Scout
 // @namespace    torn-buymugger-scout
-// @version      1.0.10
+// @version      1.0.11
 // @description  Flags buy-muggable bazaar sellers using FFScouter battle-stat estimates, with toggleable filters, a watchlist for players who are nearly back, and an in-page UI. If you enjoy it, send a Xanax to Egco [2598210].
 // @author       Egco [2598210]
 // @license      AGPL-3.0-or-later
@@ -23,11 +23,12 @@
 // ==/UserScript==
 (function() {
   "use strict";
-  const VERSION = "1.0.10";
+  const VERSION = "1.0.11";
   const STORE_PREFIX = "tbms_";
   const TORN_BASE = "https://api.torn.com";
   const FF_BASE = "https://ffscouter.com/api/v1";
   const TORN_HARD_CAP = 100;
+  const NEW_PLAYER_PROTECTION_DAYS = 14;
   const ERR_TOO_MANY = 5;
   const ERR_DAILY_LIMIT = 14;
   const ERR_BAD_KEY = 2;
@@ -113,6 +114,7 @@
       name: "",
       level: 0,
       factionId: 0,
+      age: null,
       bs: 0,
       bsUpdated: 0
     },
@@ -668,6 +670,7 @@
       name: d.name || profile.name || basic.name || null,
       level: firstNum(d.level, profile.level, basic.level),
       factionId: firstNum(d.faction_id, basic.faction_id) || 0,
+      age: firstNum(d.age, profile.age, basic.age),
       status: d.status || profile.status || null,
       lastAction: lastAction,
       stats: stats,
@@ -1083,6 +1086,13 @@
       available: available
     };
   }
+  function isNewPlayerProtected(age, myAge) {
+    const target = toNumber(age);
+    if (target === null || target >= NEW_PLAYER_PROTECTION_DAYS) return false;
+    const mine = toNumber(myAge);
+    if (mine !== null && mine < NEW_PLAYER_PROTECTION_DAYS) return target < 1;
+    return true;
+  }
   function secondsUntilFree(status, nowSec) {
     if (!status || !status.until) return null;
     const now = nowSec || Math.floor(Date.now() / 1e3);
@@ -1365,6 +1375,18 @@
       vaultAmount: null
     };
     const bazar = subject.bazaar;
+    if (subject.novice) {
+      fail.push("new player protection");
+      return {
+        id: subject.id,
+        name: subject.name,
+        score: 0,
+        verdict: "reject",
+        reasons: fail,
+        positives: [],
+        rank: 1
+      };
+    }
     if (subject.lookupError && !subject.screenedOut) fail.push(subject.lookupError);
     if (subject.screenedOut) {
       const still = strengthFailReason(subject.ff);
@@ -1592,6 +1614,8 @@
       id: id,
       name: resolvedName,
       level: u.level,
+      age: u.age,
+      novice: isNewPlayerProtected(u.age, settings.me.age),
       factionId: u.factionId,
       status: status,
       lastActionAgo: lastActionAgo,
@@ -1686,6 +1710,7 @@
   };
   function addSubject(subject) {
     if (!subject) return false;
+    if (subject.novice) return false;
     if (scan.seenIds[subject.id]) {
       let at = -1;
       for (let i = 0; i < scan.subjects.length; i++) {
@@ -1714,7 +1739,7 @@
   const RESULTS_KEY = "results_v1";
   const RESULTS_TTL_MS = 12 * 3600 * 1e3;
   const RESULTS_CAP = 200;
-  const RESULTS_SHAPE = 4;
+  const RESULTS_SHAPE = 5;
   function slimSubject(s) {
     const slimSummary = function(sum) {
       if (!sum) return null;
@@ -1734,6 +1759,8 @@
       id: s.id,
       name: s.name,
       level: s.level,
+      age: s.age,
+      novice: s.novice,
       factionId: s.factionId,
       status: s.status,
       lastActionAgo: s.lastActionAgo,
@@ -2030,6 +2057,10 @@
       try {
         const res = await fetchPlayer(entry.id);
         const sub = buildSubject(entry.id, res.data, null, entry.name);
+        if (sub.novice) {
+          delete watchlist[entry.id];
+          continue;
+        }
         const wasReady = !!entry.ready;
         entry.name = sub.name;
         entry.state = sub.status.state;
@@ -2082,6 +2113,7 @@
     const windowSec = Math.max(1, toNumber(settings.watch.windowMin) || 30) * 60;
     let added = 0;
     scan.subjects.forEach(function(sub) {
+      if (sub.novice) return;
       if (sub.lookupError || sub.screenedOut || !sub.status || sub.status.available) return;
       const left = secondsUntilFree(sub.status);
       if (left === null || left > windowSec) return;
@@ -2189,6 +2221,7 @@
         settings.me.id = id;
         settings.me.name = me.name || settings.me.name;
         settings.me.factionId = me.factionId || settings.me.factionId;
+        if (me.age !== null) settings.me.age = me.age;
         saveSettings();
       }
       return id || 0;
@@ -5226,6 +5259,7 @@
         settings.me.name = me.name || settings.me.name;
         settings.me.level = me.level || settings.me.level;
         settings.me.factionId = me.factionId || 0;
+        if (me.age !== null) settings.me.age = me.age;
         if (bs) {
           settings.me.bs = bs;
           settings.me.bsUpdated = Date.now();

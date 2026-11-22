@@ -1,6 +1,6 @@
 {
   "name": "torn-buymugger-scout",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "private": true,
   "description": "Tampermonkey userscript that flags buy-muggable bazaar and item-market sellers on Torn.",
   "scripts": {

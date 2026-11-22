@@ -1,7 +1,7 @@
 {
   "test": "repeat item scan keeps the Scan bazaars button usable",
-  "version": "1.0.10",
-  "completedAt": "2026-11-22T14:55:43.721Z",
+  "version": "1.0.11",
+  "completedAt": "2026-11-22T18:22:25.829Z",
   "item": "Xanax (206)",
   "buttonId": "tbms-item-scan-btn",
   "observed": {

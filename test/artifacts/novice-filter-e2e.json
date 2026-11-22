@@ -1,0 +1,32 @@
+{
+  "test": "novice players under new-player protection are excluded everywhere",
+  "version": "1.0.11",
+  "completedAt": "2026-11-22T18:22:24.311Z",
+  "candidates": [
+    {
+      "id": 1111111,
+      "name": "Alice",
+      "age": 45,
+      "status": "Okay",
+      "expected": "shown"
+    },
+    {
+      "id": 4444444,
+      "name": "Dave",
+      "age": 3,
+      "status": "Hospital",
+      "expected": "excluded (new player protection)"
+    }
+  ],
+  "observed": {
+    "resultRows": [
+      "44Alice#1111111 · lvl 45whole bazaarOkayseen 2m ago1.101.50mbazaar $24.00mno item selected-clearbazaar · attack · watch"
+    ],
+    "toastText": "×1 matchfrom this pageAlice44 · FF 1.10 · $0 lootattackbazaarwatchOpen panel",
+    "persistedIds": [
+      1111111
+    ],
+    "watchIds": [],
+    "noviceProfileFetches": 1
+  }
+}
