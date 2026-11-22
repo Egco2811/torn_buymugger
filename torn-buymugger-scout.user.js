@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Buy-Mug Scout
 // @namespace    torn-buymugger-scout
-// @version      1.0.9
+// @version      1.0.10
 // @description  Flags buy-muggable bazaar sellers using FFScouter battle-stat estimates, with toggleable filters, a watchlist for players who are nearly back, and an in-page UI. If you enjoy it, send a Xanax to Egco [2598210].
 // @author       Egco [2598210]
 // @license      AGPL-3.0-or-later
@@ -23,7 +23,7 @@
 // ==/UserScript==
 (function() {
   "use strict";
-  const VERSION = "1.0.9";
+  const VERSION = "1.0.10";
   const STORE_PREFIX = "tbms_";
   const TORN_BASE = "https://api.torn.com";
   const FF_BASE = "https://ffscouter.com/api/v1";
@@ -3340,7 +3340,7 @@
     const sweepBtn = document.getElementById("tbms-sweep-btn");
     const stopBtn = document.getElementById("tbms-stop-btn");
     if (scanBtn) scanBtn.disabled = running;
-    if (itemBtn) itemBtn.disabled = running || !Object.keys(itemTable).length;
+    if (itemBtn) itemBtn.disabled = running;
     if (sweepBtn) sweepBtn.disabled = running;
     if (stopBtn) stopBtn.disabled = !running;
   }
@@ -3768,9 +3768,6 @@
     try {
       const found = await findBazaarSellers(itemId);
       if (!found.sellers.length) {
-        scan.running = false;
-        setScanningUi(false);
-        clearScanProgress();
         const base = "No bazaar sellers found for " + itemLabel(itemId) + ".";
         if (found.problems) {
           found.problems.forEach(function(p) {
@@ -3821,9 +3818,6 @@
       const pool = ordered.slice(0, Math.max(1, settings.scan.maxCandidates || 300));
       const screened = pool;
       if (!screened.length) {
-        scan.running = false;
-        setScanningUi(false);
-        clearScanProgress();
         const breakdown = (found.detail || []).join(", ");
         setStatus("No sellers on " + itemLabel(itemId) + " - the sources returned nobody (" + breakdown + ").", "info");
         return;
@@ -3840,16 +3834,16 @@
         listings: listings,
         itemId: itemId
       });
-      clearScanProgress();
     } catch (e) {
-      scan.running = false;
-      setScanningUi(false);
-      clearScanProgress();
       if (background) {
         log("Auto-scan: " + e.message, "error");
       } else {
         setStatus("Item scan failed: " + e.message, "error");
       }
+    } finally {
+      clearScanProgress();
+      scan.running = false;
+      setScanningUi(false);
     }
   }
   const sweepPageCache = {};

@@ -764,6 +764,85 @@ t('scans an item\'s bazaar sellers from data, not from the page', async () => {
   dom.window.close();
 });
 
+t('re-enables Scan bazaars after a repeat scan of the same item', async () => {
+  const { dom, win, calls } = boot();
+  const doc = win.document;
+  let bazaarRequests = 0;
+  const observed = {};
+
+  win.GM_xmlhttpRequest = (() => {
+    const base = win.GM_xmlhttpRequest;
+    return function (opts) {
+      if (/v2\/market\/206\/bazaar/.test(opts.url)) {
+        bazaarRequests++;
+        calls.push(opts.url);
+        setTimeout(
+          () =>
+            opts.onload({
+              status: 200,
+              responseText: JSON.stringify({
+                bazaar: [
+                  { ID: 1111111, cost: 800000, quantity: 30 },
+                  { ID: 2222222, cost: 850000, quantity: 10 }
+                ]
+              })
+            }),
+          0
+        );
+        return;
+      }
+      return base(opts);
+    };
+  })();
+
+  const btn = doc.getElementById('tbms-item-scan-btn');
+  const input = doc.getElementById('tbms-item-input');
+
+  // A real browser refuses to dispatch a click on a disabled button, so the
+  // precondition is that the button is clickable once the item index is ready.
+  await waitFor(() => !btn.disabled, 6000, 'the Scan bazaars button to become clickable');
+  observed.enabledBeforeFirstScan = !btn.disabled;
+
+  input.value = 'Xanax';
+  input.dispatchEvent(new win.Event('input', { bubbles: true }));
+
+  btn.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => resultRows(doc).length >= 2, 9000, 'the first scan results');
+  await waitFor(() => !btn.disabled, 3000, 'the button to re-enable after the first scan');
+  observed.enabledAfterFirstScan = !btn.disabled;
+  observed.firstScanResults = resultRows(doc).length;
+
+  const before = bazaarRequests;
+  btn.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+  await waitFor(() => bazaarRequests > before, 5000, 'the repeat scan to ask for the bazaar');
+  await waitFor(() => !btn.disabled, 5000, 'the button to re-enable after the repeat scan');
+  observed.enabledAfterRepeatScan = !btn.disabled;
+  observed.repeatScanResults = resultRows(doc).length;
+  observed.bazaarRequests = bazaarRequests;
+
+  assert.equal(btn.disabled, false, 'the button is enabled after both scans');
+  assert.equal(observed.enabledBeforeFirstScan, true, 'the button was clickable to begin with');
+  assert.equal(observed.enabledAfterFirstScan, true, 'the button was clickable after the first scan');
+  assert.equal(observed.enabledAfterRepeatScan, true, 'the button was clickable after the repeat scan');
+  assert.equal(resultRows(doc).length, 2, 'the repeat scan still produced the same sellers');
+  assert.ok(bazaarRequests >= 2, 'the repeat scan actually ran against the bazaar');
+
+  const artifact = {
+    test: 'repeat item scan keeps the Scan bazaars button usable',
+    version: JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version,
+    completedAt: new Date().toISOString(),
+    item: 'Xanax (206)',
+    buttonId: 'tbms-item-scan-btn',
+    observed
+  };
+  const artifactPath = path.join(__dirname, 'artifacts', 'repeat-scan-e2e.json');
+  fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+  fs.writeFileSync(artifactPath, JSON.stringify(artifact, null, 2) + '\n');
+  assert.ok(fs.existsSync(artifactPath), 'the repeat-scan artifact was written');
+
+  dom.window.close();
+});
+
 t('falls back to the community scanner when Torn lists nothing', async () => {
   const { dom, win, calls } = boot();
   const doc = win.document;
